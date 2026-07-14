@@ -7,8 +7,8 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::document_intent;
 use crate::types::QueryIntent;
-use crate::visual::category_expansion;
 
 /// Looks like an identifier: INV-93472, ORD1234, #A1B2, 12-345-678, etc.
 static IDENTIFIER: Lazy<Regex> = Lazy::new(|| {
@@ -65,30 +65,15 @@ const CATEGORY_WORDS: &[&str] = &[
     "booking",
     "bookings",
     "reservation",
-    "product",
-    "products",
-    "conversation",
-    "conversations",
-    "chat",
-    "email",
-    "emails",
     "document",
     "documents",
-    "presentation",
-    "slide",
-    "spreadsheet",
-    "code",
-    "error",
-    "menu",
-    "recipe",
     "warranty",
     "id",
     "form",
     "payment",
+    "payments",
     "purchase",
-    "travel",
-    "work",
-    "picture",
+    "purchases",
 ];
 
 const FILE_TYPE_WORDS: &[(&str, &str)] = &[
@@ -198,8 +183,8 @@ pub fn analyze(query: &str) -> Analysis {
         push(QueryIntent::FileTypeFiltered, &mut intents);
     }
 
-    // Category expansion drives both the category intent and the label set.
-    let expanded_categories = category_expansion::expand_query(&q);
+    // Document-intent expansion drives both the category intent and label set.
+    let expanded_categories = document_intent::expand_query(&q);
     if !expanded_categories.is_empty() || contains_any(&q, CATEGORY_WORDS) {
         push(QueryIntent::Category, &mut intents);
     }
@@ -300,7 +285,7 @@ pub fn content_terms(query_lower: &str) -> Vec<String> {
 }
 
 /// A structured, deterministic plan for one query. Drives conjunction FTS,
-/// category-margin scoring, and evidence gating in [`crate::fusion`].
+/// document-intent scoring, and evidence gating in [`crate::fusion`].
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     #[allow(dead_code)] // retained for diagnostics that render the complete plan.
@@ -327,7 +312,7 @@ pub struct QueryPlan {
 pub fn plan(query: &str) -> QueryPlan {
     let raw = query.trim().to_string();
     let ql = raw.to_lowercase();
-    let expansion = category_expansion::plan_query(&ql);
+    let expansion = document_intent::plan_query(&ql);
     let mut analysis = analyze(query);
     let required_terms = content_terms(&ql);
     let mut exact_phrases = Vec::new();

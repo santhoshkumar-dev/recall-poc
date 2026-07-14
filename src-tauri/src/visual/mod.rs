@@ -4,7 +4,6 @@
 //! The image vector space is kept COMPLETELY separate from the E5 text space:
 //! separate model, separate tables, separate query encoder, fused only by rank.
 
-pub mod category_expansion;
 pub mod category_prompts;
 pub mod classify;
 pub mod encoder;

@@ -335,11 +335,13 @@ function VisualDiagnosticsPanel({
           <Row label="Selected model" value={d.visualModelId} />
           <Row label="Enabled" value={d.visualEnabled ? "Yes" : "No"} tone={d.visualEnabled ? "good" : "warn"} />
           <Row label="Files installed" value={d.filesInstalled ? "Yes" : "No"} tone={d.filesInstalled ? "good" : "bad"} />
+          <Row label="Optional tagger files" value={d.taggerFilesInstalled ? "Installed" : "Not installed"} tone={d.taggerFilesInstalled ? "good" : "warn"} />
           <Row
             label="Runtime loaded"
             value={loadOk ? "Yes" : "No"}
             tone={loadOk ? "good" : "bad"}
           />
+          <Row label="Optional tagger loaded" value={d.taggerRuntimeLoaded ? "Yes" : "No"} tone={d.taggerRuntimeLoaded ? "good" : "warn"} />
           <Row label="Load status" value={d.loadStatus} tone={loadOk ? "good" : "bad"} />
           <Row label="Embedding dims" value={d.embeddingDims ? String(d.embeddingDims) : "-"} />
           <Row label="Prompt bank" value={d.promptBankLoaded ? "Loaded" : "Not built"} tone={d.promptBankLoaded ? "good" : "warn"} />

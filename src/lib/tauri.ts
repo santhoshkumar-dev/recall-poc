@@ -42,6 +42,7 @@ export const recallApi = {
   rescanFolder: (folderId: string) => desktopInvoke<void>("rescan_folder", { folderId }),
   pause: () => desktopInvoke<void>("pause_indexing"),
   resume: () => desktopInvoke<void>("resume_indexing"),
+  forceDeleteLibrary: () => desktopInvoke<void>("force_delete_library"),
   retry: (jobId: string) => desktopInvoke<void>("retry_failed_job", { jobId }),
   indexingStatus: () => desktopInvoke<IndexingStatus>("get_indexing_status"),
   recentAssets: (limit = 20) => desktopInvoke<AssetSummary[]>("list_recent_assets", { limit }),

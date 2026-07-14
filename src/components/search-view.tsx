@@ -13,7 +13,6 @@ const MATCH_REASON_LABEL: Record<MatchReason, string> = {
   semantic_text: "Semantic text",
   visual_similarity: "Visual match",
   visual_tag: "Visual tag",
-  visual_category: "Visual category",
   date: "Date",
   amount: "Amount",
   filename: "Filename",
@@ -91,7 +90,7 @@ function Inspector({ report }: { report: SearchDebugReport }) {
         <div><span className="text-black/45">Intents:</span> {report.intents.length ? report.intents.map((i) => <Badge key={i}>{i}</Badge>) : <span className="text-black/40">none</span>}</div>
         <div><span className="text-black/45">Visual query:</span> {report.visualQuery ? "yes" : "no"}</div>
         {report.visualPrompts.length > 0 && <div><span className="text-black/45">Visual prompts:</span> {report.visualPrompts.join(" · ")}</div>}
-        {report.expandedCategories.length > 0 && <div><span className="text-black/45">Categories:</span> {report.expandedCategories.map((c) => <Badge key={c} tone="neutral">{c}</Badge>)}</div>}
+        {report.expandedCategories.length > 0 && <div><span className="text-black/45">Document hints:</span> {report.expandedCategories.map((c) => <Badge key={c} tone="neutral">{c}</Badge>)}</div>}
         {report.appliedFilters.length > 0 && <div><span className="text-black/45">Filters:</span> {report.appliedFilters.join("; ")}</div>}
       </div>
       <div className="mt-4 grid gap-4 md:grid-cols-2">
@@ -100,7 +99,7 @@ function Inspector({ report }: { report: SearchDebugReport }) {
             <div className="flex items-center justify-between font-medium"><span>{channel.channel}</span><span className="text-black/40">{channel.latencyMs} ms · {channel.candidateCount}</span></div>
             <ol className="mt-2 space-y-1 text-xs text-black/60">
               {channel.results.slice(0, 8).map((r) => (
-                <li key={r.assetId} className="flex items-center justify-between gap-2"><span className="truncate">#{r.rank + 1} {r.filename}</span><span className="tabular-nums text-black/45" title="raw channel score (cosine / BM25 / category / match-count)">{r.rawScore.toFixed(3)}</span></li>
+                <li key={r.assetId} className="flex items-center justify-between gap-2"><span className="truncate">#{r.rank + 1} {r.filename}</span><span className="tabular-nums text-black/45" title="raw channel score (cosine / BM25 / match-count)">{r.rawScore.toFixed(3)}</span></li>
               ))}
               {channel.results.length === 0 && <li className="text-black/35">no candidates</li>}
             </ol>
@@ -112,15 +111,16 @@ function Inspector({ report }: { report: SearchDebugReport }) {
           <p className="font-medium">Qualified visual evidence</p>
           <div className="mt-2 space-y-1 text-xs text-black/60">
             {report.results.slice(0, 8).map((result) => (
-              <div key={result.assetId} className="grid min-w-[860px] grid-cols-[1fr_repeat(5,90px)_170px] gap-2">
+              <div key={result.assetId} className="grid min-w-[760px] grid-cols-[1fr_repeat(3,90px)_170px_170px] gap-2">
                 <span className="truncate">{result.filename}</span>
                 <span>cos {result.visualScore.toFixed(3)}</span>
                 <span>z {result.visualZScore.toFixed(2)}</span>
                 <span>region {result.visualRegionId ?? "-"}</span>
-                <span>cat+ {result.categoryPositiveScore.toFixed(3)}</span>
-                <span>margin {result.categoryScore.toFixed(3)}</span>
                 <span className="truncate">
                   tags {result.topVisualTags.slice(0, 3).map((tag) => tag.label).join(", ") || "-"}
+                </span>
+                <span className="truncate">
+                  diagnostics {result.topCategories.slice(0, 2).map((category) => category.label).join(", ") || "-"}
                 </span>
               </div>
             ))}

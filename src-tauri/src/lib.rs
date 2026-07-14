@@ -1,6 +1,7 @@
 mod ai;
 mod commands;
 mod db;
+mod document_intent;
 mod error;
 mod extract;
 mod fusion;
@@ -184,6 +185,7 @@ pub fn run() {
             commands::rescan_folder,
             commands::pause_indexing,
             commands::resume_indexing,
+            commands::force_delete_library,
             commands::retry_failed_job,
             commands::get_indexing_status,
             commands::list_recent_assets,

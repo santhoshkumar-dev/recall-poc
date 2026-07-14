@@ -4,6 +4,8 @@ use std::{
     io::Read,
     path::Path,
     sync::{atomic::Ordering, Arc},
+    thread,
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -375,22 +377,6 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
 /// change or failed visual pass never requires re-running OCR.
 fn queue_derived_stages(core: &AppCore, asset: &crate::types::AssetRecord) -> Result<()> {
     let selection = crate::ai::selection(&core.db_path)?;
-    db::queue_extraction_stage(
-        &core.db_path,
-        &asset.id,
-        "analysis",
-        "recall-deterministic-metadata",
-        crate::metadata::METADATA_EXTRACTOR_VERSION,
-    )?;
-    if core.ai.read().is_some() {
-        db::queue_extraction_stage(
-            &core.db_path,
-            &asset.id,
-            "text_embedding",
-            &selection.embedding_model_id,
-            crate::ai::CHUNKING_VERSION,
-        )?;
-    }
     if is_image_extension(&asset.extension)
         && core.visual.read().is_some()
         && selection.visual_enabled()
@@ -403,6 +389,22 @@ fn queue_derived_stages(core: &AppCore, asset: &crate::types::AssetRecord) -> Re
             crate::ai::VISUAL_MODEL_VERSION,
         )?;
     }
+    if core.ai.read().is_some() {
+        db::queue_extraction_stage(
+            &core.db_path,
+            &asset.id,
+            "text_embedding",
+            &selection.embedding_model_id,
+            crate::ai::CHUNKING_VERSION,
+        )?;
+    }
+    db::queue_extraction_stage(
+        &core.db_path,
+        &asset.id,
+        "analysis",
+        "recall-deterministic-metadata",
+        crate::metadata::METADATA_EXTRACTOR_VERSION,
+    )?;
     if is_image_extension(&asset.extension)
         && core.visual_tagger.read().is_some()
         && selection.visual_enabled()
@@ -439,7 +441,9 @@ fn process_extraction_stage(
     let result = match stage {
         "text_embedding" => run_text_embedding_stage(core, asset),
         "visual" => run_visual_pass(core, asset, "index"),
+        "visual_regions" => run_visual_pass(core, asset, "regions"),
         "visual_tagging" => run_visual_tagging_stage(core, asset),
+        "visual_region_tagging" => run_visual_region_tagging_stage(core, asset),
         "analysis" => run_text_enrichment(app, core, asset, job_id),
         unknown => Err(format!("Unknown extraction stage: {unknown}").into()),
     }
@@ -478,6 +482,12 @@ fn process_extraction_stage(
             );
         }
     }
+    if matches!(
+        stage,
+        "visual_tagging" | "visual_regions" | "visual_region_tagging"
+    ) {
+        thread::sleep(Duration::from_millis(120));
+    }
 }
 
 fn run_text_embedding_stage(core: &AppCore, asset: &crate::types::AssetRecord) -> Result<()> {
@@ -504,20 +514,57 @@ fn run_visual_tagging_stage(core: &AppCore, asset: &crate::types::AssetRecord) -
     if !is_image_extension(&asset.extension) {
         return Ok(());
     }
-    let tagger = core
-        .visual_tagger
-        .read()
-        .clone()
-        .ok_or("Local visual tagger model required")?;
+    let Some(tagger) = core.visual_tagger.read().clone() else {
+        return Ok(());
+    };
     let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
     let regions = extract::image_regions(&image);
     let mut tags = Vec::new();
-    for crop in regions {
+    if let Some(crop) = regions.first() {
         tags.extend(tagger.tag_image(&crop.image, crop.region.region_id)?);
     }
+    save_ranked_visual_tags(core, asset, tags)?;
+    if regions.len() > 1 {
+        db::queue_extraction_stage(
+            &core.db_path,
+            &asset.id,
+            "visual_region_tagging",
+            crate::ai::VISUAL_TAGGER_GENERAL,
+            crate::ai::VISUAL_TAGGER_VERSION,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_visual_region_tagging_stage(
+    core: &AppCore,
+    asset: &crate::types::AssetRecord,
+) -> Result<()> {
+    if !is_image_extension(&asset.extension) {
+        return Ok(());
+    }
+    let Some(tagger) = core.visual_tagger.read().clone() else {
+        return Ok(());
+    };
+    let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
+    let mut tags = db::visual_tags_for(&core.db_path, &asset.id, crate::ai::VISUAL_TAGGER_GENERAL)?;
+    for crop in extract::image_regions(&image).into_iter().skip(1) {
+        tags.extend(tagger.tag_image(&crop.image, crop.region.region_id)?);
+    }
+    save_ranked_visual_tags(core, asset, tags)
+}
+
+fn save_ranked_visual_tags(
+    core: &AppCore,
+    asset: &crate::types::AssetRecord,
+    tags: Vec<crate::types::VisualTag>,
+) -> Result<()> {
     let mut best_by_label = std::collections::HashMap::<String, crate::types::VisualTag>::new();
     for tag in tags {
         let key = db::normalize_visual_tag(&tag.label);
+        if key.is_empty() {
+            continue;
+        }
         best_by_label
             .entry(key)
             .and_modify(|existing| {
@@ -657,7 +704,8 @@ fn run_visual_pass(core: &AppCore, asset: &crate::types::AssetRecord, stage: &st
     let bank = prompt_bank(core, &runtime, &model_id)?;
 
     // Reuse all cached image-region embeddings when only re-categorizing.
-    // Full visual stages rebuild both vectors and their crop provenance.
+    // The normal visual stage is intentionally whole-image only; optional
+    // regions are queued as lower-priority background work.
     let embeddings: Vec<(i64, Vec<f32>)> = if stage == "recategorize" {
         let cached = db::image_embeddings_for_all(&core.db_path, &asset.id, &model_id)?;
         if cached.is_empty() {
@@ -687,12 +735,11 @@ fn run_visual_pass(core: &AppCore, asset: &crate::types::AssetRecord, stage: &st
         } else {
             cached
         }
-    } else {
+    } else if stage == "regions" {
         let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
         let regions = extract::image_regions(&image);
-        db::delete_image_embeddings(&core.db_path, &asset.id, &model_id)?;
-        let mut output = Vec::new();
-        for crop in regions {
+        let mut output = db::image_embeddings_for_all(&core.db_path, &asset.id, &model_id)?;
+        for crop in regions.into_iter().skip(1) {
             let embedding = runtime.embed_image(&crop.image)?;
             db::save_image_embedding(
                 &core.db_path,
@@ -712,6 +759,40 @@ fn run_visual_pass(core: &AppCore, asset: &crate::types::AssetRecord, stage: &st
             output.push((crop.region.region_id, embedding));
         }
         output
+    } else {
+        let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
+        let regions = extract::image_regions(&image);
+        db::delete_image_embeddings(&core.db_path, &asset.id, &model_id)?;
+        let mut output = Vec::new();
+        if let Some(crop) = regions.first() {
+            let embedding = runtime.embed_image(&crop.image)?;
+            db::save_image_embedding(
+                &core.db_path,
+                &asset.id,
+                &model_id,
+                crate::ai::VISUAL_MODEL_VERSION,
+                crop.region.region_id,
+                &embedding,
+            )?;
+            db::save_image_embedding_region(
+                &core.db_path,
+                &asset.id,
+                &model_id,
+                &crop.region,
+                crate::ai::VISUAL_MODEL_VERSION,
+            )?;
+            output.push((crop.region.region_id, embedding));
+        }
+        if regions.len() > 1 {
+            db::queue_extraction_stage(
+                &core.db_path,
+                &asset.id,
+                "visual_regions",
+                &model_id,
+                crate::ai::VISUAL_MODEL_VERSION,
+            )?;
+        }
+        output
     };
     let embedding = embeddings
         .iter()
@@ -728,8 +809,9 @@ fn run_visual_pass(core: &AppCore, asset: &crate::types::AssetRecord, stage: &st
         .map(|c| format!("{} {:.2}", c.label, c.score))
         .unwrap_or_else(|| "none".into());
     eprintln!(
-        "[visual] embedded {} (dims={}, top category: {})",
+        "[visual] embedded {} (stage={}, dims={}, top category: {})",
         asset.filename,
+        stage,
         embedding.len(),
         top
     );

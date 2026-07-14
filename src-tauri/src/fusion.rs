@@ -1,16 +1,18 @@
 //! Multimodal retrieval fusion with evidence gating.
 //!
 //! Builds a deterministic [`QueryPlan`], runs the retrieval channels (exact
-//! text via conjunction FTS, semantic text, visual, visual-category margin,
-//! metadata, filename), and combines them with intent-aware one-based
+//! text via conjunction FTS, semantic text, visual, visual tags, metadata,
+//! filename), and combines them with intent-aware one-based
 //! Reciprocal-Rank Fusion. A result is returned only if it clears an evidence
 //! bar (one strong OR two moderate signals; semantic-text alone never
 //! qualifies). When nothing clears the bar the result set is empty — no weak
 //! result is ever normalized into a "100% match".
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Instant;
+
+#[cfg(test)]
+use std::sync::Arc;
 
 use crate::{
     ai, db,
@@ -21,14 +23,15 @@ use crate::{
         AssetBrief, ChannelDiagnostics, ChannelResult, MatchReason, QueryIntent, SearchDebugReport,
         SearchFilters, SearchResult, VisualCategory,
     },
-    visual::PromptBank,
     AppCore,
 };
+
+#[cfg(test)]
+use crate::visual::PromptBank;
 
 const RRF_K: f32 = 60.0;
 const TEXT_CANDIDATES: usize = 50;
 const VISUAL_CANDIDATES: usize = 50;
-const CATEGORY_CANDIDATES: usize = 40;
 const METADATA_CANDIDATES: usize = 40;
 const MAX_RESULTS: usize = 20;
 
@@ -43,11 +46,6 @@ const VIS_Z_INCLUDE: f32 = 2.5;
 const VIS_Z_MODERATE: f32 = 3.0;
 const VIS_Z_STRONG: f32 = 3.5;
 const VIS_MAD_FLOOR: f32 = 0.01;
-// Visual-category margin (primary − best-other).
-const CAT_POSITIVE_FLOOR: f32 = 0.10;
-const CAT_MARGIN_STRONG: f32 = 0.025;
-const CAT_MARGIN_MODERATE: f32 = 0.01;
-const CAT_MARGIN_INCLUDE: f32 = 0.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Channel {
@@ -55,7 +53,6 @@ enum Channel {
     Semantic,
     Visual,
     VisualTag,
-    Category,
     DocumentType,
     Entity,
     Metadata,
@@ -69,7 +66,6 @@ impl Channel {
             Channel::Semantic => "semantic_text",
             Channel::Visual => "visual",
             Channel::VisualTag => "visual_tag",
-            Channel::Category => "visual_category",
             Channel::DocumentType => "document_type",
             Channel::Entity => "entity",
             Channel::Metadata => "metadata",
@@ -89,28 +85,28 @@ fn weights(intent: QueryIntent) -> HashMap<Channel, f32> {
             (Visual, 0.05),
         ],
         QueryIntent::Visual => &[
-            (Visual, 0.45),
+            (Visual, 0.50),
             (VisualTag, 0.30),
-            (Category, 0.05),
             (Semantic, 0.08),
             (Metadata, 0.07),
             (Filename, 0.05),
         ],
-        // Specific/broad category queries: category-led, with strong exact text.
+        // Deterministic document-intent queries: document metadata and exact
+        // OCR stay primary. Visual tags can help image-only assets, but generic
+        // visual prompt-bank labels are not retrieval evidence.
         QueryIntent::Category => &[
-            (Category, 0.20),
-            (DocumentType, 0.25),
-            (Exact, 0.23),
+            (DocumentType, 0.30),
+            (Exact, 0.25),
             (VisualTag, 0.10),
-            (Semantic, 0.15),
-            (Metadata, 0.05),
-            (Visual, 0.02),
+            (Semantic, 0.20),
+            (Metadata, 0.10),
+            (Visual, 0.05),
         ],
         QueryIntent::DateFiltered => &[
-            (Semantic, 0.30),
-            (Category, 0.25),
-            (Visual, 0.25),
-            (Exact, 0.15),
+            (Semantic, 0.35),
+            (Visual, 0.30),
+            (Exact, 0.20),
+            (Metadata, 0.10),
             (Filename, 0.05),
         ],
         _ => &[
@@ -300,19 +296,14 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
         });
     }
 
-    // Visual + category-margin (single pass over image embeddings).
+    // Visual text-to-image similarity (single pass over image embeddings).
     let visual = core.visual.read().clone();
     let mut visual_by_asset: HashMap<String, f32> = HashMap::new();
     let mut visual_z_by_asset: HashMap<String, f32> = HashMap::new();
-    let mut category_by_asset: HashMap<String, f32> = HashMap::new();
-    let mut category_positive_by_asset: HashMap<String, f32> = HashMap::new();
-    let mut category_negative_by_asset: HashMap<String, f32> = HashMap::new();
     let mut visual_region_scores: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut category_region_scores: HashMap<String, Vec<(f32, f32, f32)>> = HashMap::new();
     let mut visual_best_region: HashMap<String, (i64, f32)> = HashMap::new();
     if let Some(runtime) = visual.as_ref() {
         let model_id = ai::selection(&core.db_path)?.visual_model_id;
-        let bank = prompt_bank(core, runtime, &model_id).ok();
 
         let t = Instant::now();
         let query_vectors = plan
@@ -342,32 +333,9 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
                     }
                 })
                 .or_insert((*page, vsim));
-            if !plan.category_labels.is_empty() {
-                if let Some(bank) = bank.as_ref() {
-                    let (positive, negative, margin) =
-                        bank.category_set_margin(emb, &plan.category_labels);
-                    category_region_scores
-                        .entry(id.clone())
-                        .or_default()
-                        .push((positive, negative, margin));
-                }
-            }
         }
         for (id, scores) in visual_region_scores {
             visual_by_asset.insert(id, aggregate_region_scores(&scores));
-        }
-        for (id, scores) in category_region_scores {
-            // Keep all three values from the same best region; combining the
-            // best positive and best negative from different crops distorts the
-            // category margin for screenshots.
-            if let Some((positive, negative, margin)) = scores
-                .into_iter()
-                .max_by(|left, right| left.2.total_cmp(&right.2))
-            {
-                category_positive_by_asset.insert(id.clone(), positive);
-                category_negative_by_asset.insert(id.clone(), negative);
-                category_by_asset.insert(id, margin);
-            }
         }
         let (visual_median, visual_mad) =
             robust_location_scale(&visual_by_asset.values().copied().collect::<Vec<_>>());
@@ -397,25 +365,6 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
             ranked: top_n(visual_hits, VISUAL_CANDIDATES),
             latency_ms: vt,
         });
-
-        if !plan.category_labels.is_empty() && bank.is_some() {
-            let t = Instant::now();
-            let mut category_hits: Vec<(String, f32)> = category_by_asset
-                .iter()
-                .filter(|(id, margin)| {
-                    **margin >= CAT_MARGIN_INCLUDE
-                        && category_positive_by_asset.get(*id).copied().unwrap_or(0.0)
-                            >= CAT_POSITIVE_FLOOR
-                })
-                .map(|(id, margin)| (id.clone(), *margin))
-                .collect();
-            category_hits.sort_by(|a, b| b.1.total_cmp(&a.1));
-            runs.push(ChannelRun {
-                channel: Channel::Category,
-                ranked: top_n(category_hits, CATEGORY_CANDIDATES),
-                latency_ms: t.elapsed().as_millis(),
-            });
-        }
     }
 
     let t = Instant::now();
@@ -508,15 +457,6 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
         let semantic = semantic_by_asset.get(asset_id).copied().unwrap_or(0.0);
         let visual_s = visual_by_asset.get(asset_id).copied().unwrap_or(0.0);
         let visual_z = visual_z_by_asset.get(asset_id).copied().unwrap_or(0.0);
-        let category_s = category_by_asset.get(asset_id).copied().unwrap_or(0.0);
-        let category_positive = category_positive_by_asset
-            .get(asset_id)
-            .copied()
-            .unwrap_or(0.0);
-        let category_negative = category_negative_by_asset
-            .get(asset_id)
-            .copied()
-            .unwrap_or(0.0);
         let visual_tag_s = visual_tag_by_asset.get(asset_id).copied().unwrap_or(0.0);
         let filename_s = filename_by_asset.get(asset_id).copied().unwrap_or(0.0);
         let metadata_s = metadata_by_asset.get(asset_id).copied().unwrap_or(0.0);
@@ -551,17 +491,6 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
             MatchReason::VisualTag,
             visual_tag_strength(visual_tag_s, plan.visual_query, is_document_query(&plan)),
         ));
-        // A generic visual ticket label alone is never enough for a sensitive
-        // document query. OCR/entity/document-type evidence must corroborate it.
-        let cat_strength = if is_document_query(&plan) {
-            match category_strength(category_positive, category_s) {
-                Strength::Strong => Strength::Moderate,
-                value => value,
-            }
-        } else {
-            category_strength(category_positive, category_s)
-        };
-        strengths.push((MatchReason::VisualCategory, cat_strength));
         strengths.push((
             MatchReason::Metadata,
             if metadata_s >= 2.0 {
@@ -634,9 +563,6 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
         result.visual_score = visual_s;
         result.visual_z_score = visual_z;
         result.visual_region_id = visual_best_region.get(asset_id).map(|(region, _)| *region);
-        result.category_score = category_s;
-        result.category_positive_score = category_positive;
-        result.category_negative_score = category_negative;
         result.match_reasons = reasons;
         result.top_categories = top_categories;
         result.top_visual_tags = top_visual_tags;
@@ -668,16 +594,6 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
     Ok(finish(results, channels, applied_filters))
 }
 
-fn strength(value: f32, strong: f32, moderate: f32) -> Strength {
-    if value >= strong {
-        Strength::Strong
-    } else if value >= moderate {
-        Strength::Moderate
-    } else {
-        Strength::None
-    }
-}
-
 fn visual_strength(raw: f32, robust_z: f32, visual_query: bool) -> Strength {
     if visual_query && raw >= VIS_RAW_STRONG && robust_z >= VIS_Z_STRONG {
         Strength::Strong
@@ -685,14 +601,6 @@ fn visual_strength(raw: f32, robust_z: f32, visual_query: bool) -> Strength {
         Strength::Moderate
     } else {
         Strength::None
-    }
-}
-
-fn category_strength(positive: f32, margin: f32) -> Strength {
-    if positive < CAT_POSITIVE_FLOOR {
-        Strength::None
-    } else {
-        strength(margin, CAT_MARGIN_STRONG, CAT_MARGIN_MODERATE)
     }
 }
 
@@ -764,6 +672,7 @@ fn confidence_for(strengths: impl IntoIterator<Item = Strength>) -> Option<&'sta
 }
 
 /// Lazily build / fetch the cached prompt-embedding bank.
+#[cfg(test)]
 fn prompt_bank(
     core: &AppCore,
     runtime: &crate::visual::VisualRuntime,
@@ -1051,13 +960,6 @@ mod tests {
         let (median, mad) = robust_location_scale(&values);
         let z = (0.12 - median) / mad.max(VIS_MAD_FLOOR);
         assert_eq!(visual_strength(0.12, z, true), Strength::None);
-    }
-
-    #[test]
-    fn category_strength_uses_positive_floor_and_margin() {
-        assert_eq!(category_strength(0.09, 0.05), Strength::None);
-        assert_eq!(category_strength(0.12, 0.015), Strength::Moderate);
-        assert_eq!(category_strength(0.14, 0.03), Strength::Strong);
     }
 
     #[test]

@@ -55,6 +55,9 @@ export interface IndexingStatus {
   indexed: number;
   skipped: number;
   failed: number;
+  backgroundPending: number;
+  backgroundProcessing: number;
+  currentStage?: string;
   currentFile?: string;
 }
 
@@ -90,7 +93,6 @@ export type MatchReason =
   | "semantic_text"
   | "visual_similarity"
   | "visual_tag"
-  | "visual_category"
   | "date"
   | "amount"
   | "filename"
@@ -168,6 +170,8 @@ export interface VisualDiagnostics {
   visualEnabled: boolean;
   filesInstalled: boolean;
   runtimeLoaded: boolean;
+  taggerFilesInstalled: boolean;
+  taggerRuntimeLoaded: boolean;
   embeddingDims?: number;
   promptBankLoaded: boolean;
   loadStatus: string;

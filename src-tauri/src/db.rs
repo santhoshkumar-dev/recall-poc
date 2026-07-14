@@ -57,7 +57,6 @@ pub fn migrate(path: &Path) -> Result<()> {
           source TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_chunks_asset ON chunks(asset_id);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_asset_source ON chunks(asset_id, source) WHERE source IS NOT NULL;
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(chunk_id UNINDEXED, text, tokenize='unicode61');
         CREATE TABLE IF NOT EXISTS indexing_jobs (
           id TEXT PRIMARY KEY,
@@ -122,8 +121,6 @@ pub fn migrate(path: &Path) -> Result<()> {
               first_seen_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
-            ALTER TABLE assets ADD COLUMN content_id TEXT REFERENCES content_items(id);
-            CREATE INDEX IF NOT EXISTS idx_assets_content ON assets(content_id);
             CREATE TABLE IF NOT EXISTS extraction_provenance (
               id TEXT PRIMARY KEY,
               asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -159,6 +156,14 @@ pub fn migrate(path: &Path) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_entities_value ON extracted_entities(normalized_value, entity_type);
         "#,
         )?;
+        if !column_exists(&connection, "assets", "content_id")? {
+            connection.execute_batch(
+                "ALTER TABLE assets ADD COLUMN content_id TEXT REFERENCES content_items(id);",
+            )?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_assets_content ON assets(content_id);",
+        )?;
         // Backfill stable content identities for databases created before v2.
         let mut statement = connection.prepare(
             "SELECT id, sha256 FROM assets WHERE sha256 IS NOT NULL AND content_id IS NULL",
@@ -168,9 +173,7 @@ pub fn migrate(path: &Path) -> Result<()> {
             .collect::<std::result::Result<_, _>>()?;
         drop(statement);
         for (asset_id, sha256) in rows {
-            let content_id = uuid::Uuid::new_v4().to_string();
-            let now = Utc::now().to_rfc3339();
-            connection.execute("INSERT OR IGNORE INTO content_items(id,sha256,first_seen_at,updated_at) VALUES (?1,?2,?3,?3)", params![content_id, sha256, now])?;
+            let content_id = ensure_content_item(&connection, &sha256)?;
             connection.execute(
                 "UPDATE assets SET content_id=?2 WHERE id=?1",
                 params![asset_id, content_id],
@@ -224,8 +227,13 @@ pub fn migrate(path: &Path) -> Result<()> {
         // Stage jobs are independent of source indexing jobs. Keep both links
         // so old provenance remains valid while derived-stage outputs can point
         // at the job that actually produced them.
+        if !column_exists(&connection, "extraction_provenance", "stage_job_id")? {
+            connection.execute_batch(
+                "ALTER TABLE extraction_provenance ADD COLUMN stage_job_id TEXT REFERENCES extraction_stage_jobs(id) ON DELETE SET NULL;",
+            )?;
+        }
         connection.execute_batch(
-            "ALTER TABLE extraction_provenance ADD COLUMN stage_job_id TEXT REFERENCES extraction_stage_jobs(id) ON DELETE SET NULL;\n             CREATE INDEX IF NOT EXISTS idx_provenance_stage_job ON extraction_provenance(stage_job_id);",
+            "CREATE INDEX IF NOT EXISTS idx_provenance_stage_job ON extraction_provenance(stage_job_id);",
         )?;
         version = 5;
     }
@@ -359,39 +367,85 @@ pub fn list_folders(path: &Path) -> Result<Vec<WatchedFolder>> {
 
 pub fn indexing_status(path: &Path) -> Result<IndexingStatus> {
     let connection = connect(path)?;
-    let count = |state: &str| -> rusqlite::Result<i64> {
-        connection
-            .query_row(
-                "SELECT COUNT(*) FROM indexing_jobs WHERE state=?1",
-                [state],
-                |r| r.get::<_, i64>(0),
-            )
-            .and_then(|base| {
-                connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM extraction_stage_jobs WHERE state=?1",
-                        [state],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .map(|derived| base + derived)
-            })
+    let asset_count = |state: &str| -> rusqlite::Result<i64> {
+        connection.query_row(
+            "SELECT COUNT(*) FROM assets WHERE available=1 AND status=?1",
+            [state],
+            |r| r.get::<_, i64>(0),
+        )
     };
-    let current_file = connection.query_row(
-        "SELECT filename FROM (
-           SELECT a.filename FROM indexing_jobs j JOIN assets a ON a.id=j.asset_id WHERE j.state='processing'
+    let processing = connection.query_row(
+        "SELECT COUNT(DISTINCT asset_id) FROM (
+           SELECT asset_id FROM indexing_jobs WHERE state='processing'
            UNION ALL
-           SELECT a.filename FROM extraction_stage_jobs j JOIN assets a ON a.id=j.asset_id WHERE j.state='processing'
-         ) LIMIT 1", [], |r| r.get(0),
-    ).optional()?;
+           SELECT asset_id FROM extraction_stage_jobs WHERE state='processing'
+         )",
+        [],
+        |r| r.get::<_, i64>(0),
+    )?;
+    let background_pending = connection.query_row(
+        "SELECT COUNT(*) FROM extraction_stage_jobs WHERE state='pending'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )?;
+    let background_processing = connection.query_row(
+        "SELECT COUNT(*) FROM extraction_stage_jobs WHERE state='processing'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )?;
+    let failed_stages = connection.query_row(
+        "SELECT COUNT(DISTINCT asset_id) FROM extraction_stage_jobs WHERE state='failed'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )?;
+    let failed = asset_count("failed")? + failed_stages;
+    let current = connection
+        .query_row(
+            "SELECT filename, stage FROM (
+           SELECT a.filename, j.stage FROM indexing_jobs j JOIN assets a ON a.id=j.asset_id WHERE j.state='processing'
+           UNION ALL
+           SELECT a.filename, j.stage FROM extraction_stage_jobs j JOIN assets a ON a.id=j.asset_id WHERE j.state='processing'
+         ) LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (current_file, current_stage) = current
+        .map(|(file, stage)| (Some(file), Some(stage)))
+        .unwrap_or((None, None));
     Ok(IndexingStatus {
         paused: setting(&connection, "queue_paused", "false")? == "true",
-        pending: count("pending")?,
-        processing: count("processing")?,
-        indexed: count("indexed")?,
-        skipped: count("skipped")?,
-        failed: count("failed")?,
+        pending: asset_count("pending")?,
+        processing,
+        indexed: asset_count("indexed")?,
+        skipped: asset_count("skipped")?,
+        failed,
+        background_pending,
+        background_processing,
+        current_stage,
         current_file,
     })
+}
+
+/// Internal queue counts include derived extraction stages. Use this for
+/// operational guards and developer diagnostics, not for the user-facing file
+/// queue cards.
+pub fn active_job_counts(path: &Path) -> Result<(i64, i64, i64)> {
+    let connection = connect(path)?;
+    let count = |state: &str| -> rusqlite::Result<i64> {
+        let source = connection.query_row(
+            "SELECT COUNT(*) FROM indexing_jobs WHERE state=?1",
+            [state],
+            |r| r.get::<_, i64>(0),
+        )?;
+        let derived = connection.query_row(
+            "SELECT COUNT(*) FROM extraction_stage_jobs WHERE state=?1",
+            [state],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(source + derived)
+    };
+    Ok((count("pending")?, count("processing")?, count("failed")?))
 }
 
 pub fn list_recent_assets(path: &Path, limit: i64) -> Result<Vec<AssetSummary>> {
@@ -481,7 +535,15 @@ pub fn claim_next_extraction_stage_job(
         "SELECT j.id,j.stage,a.id,a.folder_id,a.absolute_path,a.filename,COALESCE(a.extension,'')
          FROM extraction_stage_jobs j JOIN assets a ON a.id=j.asset_id
          WHERE j.state='pending' AND a.available=1 AND a.status='indexed'
-         ORDER BY j.created_at LIMIT 1",
+         ORDER BY CASE j.stage
+           WHEN 'visual' THEN 10
+           WHEN 'text_embedding' THEN 20
+           WHEN 'analysis' THEN 30
+           WHEN 'visual_tagging' THEN 40
+           WHEN 'visual_regions' THEN 50
+           WHEN 'visual_region_tagging' THEN 60
+           ELSE 90
+         END, j.created_at LIMIT 1",
         [],
         |row| Ok((
             row.get(0)?, row.get(1)?, AssetRecord {
@@ -1736,6 +1798,45 @@ mod tests {
         assert_eq!(cat_hits, 0);
         assert_eq!(dog_hits, 1);
         drop(connection);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn indexing_status_pending_is_file_based_not_stage_based() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("recall-status-{}.db", uuid::Uuid::new_v4()));
+        migrate(&path)?;
+        let connection = connect(&path)?;
+        connection.execute(
+            "INSERT INTO watched_folders(id,path,created_at) VALUES ('folder','C:/files','now')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO assets(id,folder_id,absolute_path,relative_path,filename,extension,mime_type,size_bytes,modified_at,status,available)
+             VALUES ('asset','folder','C:/files/cat.png','cat.png','cat.png','png','image/png',1,'now','indexed',1)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO indexing_jobs(id,asset_id,stage,state,created_at,updated_at)
+             VALUES ('source','asset','index','indexed','now','now')",
+            [],
+        )?;
+        drop(connection);
+
+        queue_extraction_stage(
+            &path,
+            "asset",
+            "visual_tagging",
+            "visual-tags/general-v1",
+            "1",
+        )?;
+        let public = indexing_status(&path)?;
+        assert_eq!(public.pending, 0);
+        assert_eq!(public.indexed, 1);
+        assert_eq!(public.background_pending, 1);
+        assert_eq!(public.background_processing, 0);
+        assert_eq!(active_job_counts(&path)?, (1, 0, 0));
+
         let _ = std::fs::remove_file(path);
         Ok(())
     }

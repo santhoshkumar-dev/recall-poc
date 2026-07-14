@@ -186,8 +186,3 @@ pub fn flattened_prompts() -> Vec<(&'static str, &'static str)> {
         .flat_map(|(label, prompts)| prompts.iter().map(move |p| (*label, *p)))
         .collect()
 }
-
-/// All known category labels.
-pub fn all_labels() -> Vec<&'static str> {
-    CATEGORY_PROMPTS.iter().map(|(l, _)| *l).collect()
-}

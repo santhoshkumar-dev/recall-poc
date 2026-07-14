@@ -78,13 +78,6 @@ const MOBILECLIP_TEXT_SHA256: &str =
     "df590d47744f2ee9f3ccb67c4414d17419568c05bca0c4d166f2faeedf8b92f3";
 const MOBILECLIP_TOKENIZER_URL: &str =
     "https://huggingface.co/plhery/mobileclip2-onnx/resolve/main/tokenizer.json";
-const WD_SWINV2_TAGGER_MODEL_URL: &str =
-    "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/model.onnx";
-const WD_SWINV2_TAGGER_MODEL_SHA256: &str =
-    "e61cc3e30576e50c745bd2224a2d03bec65637a84328301da8717d291d9eb96a";
-const WD_SWINV2_TAGGER_LABELS_URL: &str =
-    "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/selected_tags.csv";
-
 pub const OCRS_NATIVE: &str = "ocrs-native";
 pub const PPOCRV6_TINY: &str = "ppocrv6-tiny";
 pub const PPOCRV6_SMALL: &str = "ppocrv6-small";
@@ -103,10 +96,10 @@ pub const VISUAL_TAGGER_VERSION: &str = "1";
 pub const CHUNKING_VERSION: &str = "3";
 pub const DEFAULT_OCR_MODEL: &str = PPOCRV6_TINY;
 pub const DEFAULT_EMBEDDING_MODEL: &str = E5_SMALL;
-pub const DEFAULT_VISUAL_MODEL: &str = VISUAL_DISABLED;
+pub const DEFAULT_VISUAL_MODEL: &str = MOBILECLIP2_S0;
 pub const DEFAULT_OCR_MAX_SIDE: u32 = 1280;
 const DEFAULT_OCR_MAX_SIDE_SETTING: &str = "1280";
-const DEFAULT_PROFILE_VERSION: &str = "2";
+const DEFAULT_PROFILE_VERSION: &str = "3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -267,17 +260,22 @@ pub fn ensure_defaults(db_path: &Path, _model_dir: &Path) -> Result<()> {
     if db::setting(&connection, "visual_model_id", "")?.is_empty() {
         db::set_setting(&connection, "visual_model_id", DEFAULT_VISUAL_MODEL)?;
     }
-    if db::setting(&connection, "model_default_profile", "")?.is_empty() {
+    let profile = db::setting(&connection, "model_default_profile", "")?;
+    if profile != DEFAULT_PROFILE_VERSION {
         let ocr_model = db::setting(&connection, "ocr_model_id", DEFAULT_OCR_MODEL)?;
         let embedding_model =
             db::setting(&connection, "embedding_model_id", DEFAULT_EMBEDDING_MODEL)?;
         let max_side = db::setting(&connection, "ocr_max_side", DEFAULT_OCR_MAX_SIDE_SETTING)?;
+        let visual_model = db::setting(&connection, "visual_model_id", VISUAL_DISABLED)?;
         if matches!(ocr_model.as_str(), OCRS_NATIVE | PPOCRV6_SMALL)
             && embedding_model == E5_SMALL
             && max_side == "1600"
         {
             db::set_setting(&connection, "ocr_model_id", DEFAULT_OCR_MODEL)?;
             db::set_setting(&connection, "ocr_max_side", DEFAULT_OCR_MAX_SIDE_SETTING)?;
+        }
+        if visual_model == VISUAL_DISABLED || visual_model.is_empty() {
+            db::set_setting(&connection, "visual_model_id", DEFAULT_VISUAL_MODEL)?;
         }
         db::set_setting(
             &connection,
@@ -449,10 +447,9 @@ pub fn install_selection(
     install_embedding(app, model_dir, &selected.embedding_model_id)?;
     if selected.visual_enabled() {
         install_visual(app, model_dir, &selected.visual_model_id)?;
-        install_visual_tagger(app, model_dir)?;
     }
     let runtime = Arc::new(AiRuntime::load_for_selection(model_dir, selected)?);
-    emit(app, 94, "downloading", "Verifying offline model runtime")?;
+    emit(app, 99, "downloading", "Verifying offline model runtime")?;
     write_ready_marker(model_dir, selected)?;
     save_selection(db_path, selected)?;
     emit(
@@ -480,6 +477,7 @@ pub fn model_dir_is_complete(db_path: &Path, model_dir: &Path) -> bool {
     };
     is_ocr_installed(model_dir, &selected.ocr_model_id)
         && is_embedding_installed(model_dir, &selected.embedding_model_id)
+        && (!selected.visual_enabled() || is_visual_installed(model_dir, &selected.visual_model_id))
 }
 
 pub fn set_state(db_path: &Path, value: &str) -> Result<()> {
@@ -694,15 +692,15 @@ fn install_visual(app: &AppHandle, model_dir: &Path, model_id: &str) -> Result<(
         &directory.join("vision_model.onnx"),
         MOBILECLIP_VISION_SHA256,
         90,
-        93,
+        92,
     )?;
     download_verified(
         app,
         MOBILECLIP_TEXT_URL,
         &directory.join("text_model.onnx"),
         MOBILECLIP_TEXT_SHA256,
-        93,
-        97,
+        92,
+        94,
     )?;
     // Only tokenizer.json is read at runtime; config.json (98 B) /
     // preprocessor_config.json values are hardcoded in the encoder, and their
@@ -711,32 +709,10 @@ fn install_visual(app: &AppHandle, model_dir: &Path, model_id: &str) -> Result<(
         app,
         MOBILECLIP_TOKENIZER_URL,
         &directory.join("tokenizer.json"),
-        97,
-        99,
+        94,
+        95,
     )?;
-    emit(app, 99, "downloading", "MobileCLIP2-S0 files verified")
-}
-
-fn install_visual_tagger(app: &AppHandle, model_dir: &Path) -> Result<()> {
-    let directory = visual_tagger_directory(model_dir);
-    fs::create_dir_all(&directory)?;
-    emit(app, 99, "downloading", "Preparing general visual tagger")?;
-    download_verified(
-        app,
-        WD_SWINV2_TAGGER_MODEL_URL,
-        &directory.join("model.onnx"),
-        WD_SWINV2_TAGGER_MODEL_SHA256,
-        99,
-        99,
-    )?;
-    download_file(
-        app,
-        WD_SWINV2_TAGGER_LABELS_URL,
-        &directory.join("selected_tags.csv"),
-        99,
-        99,
-    )?;
-    emit(app, 99, "downloading", "Visual tagger files verified")
+    emit(app, 95, "downloading", "MobileCLIP2-S0 files verified")
 }
 
 /// Load the visual runtime for a selection, if a visual model is enabled and
@@ -1197,6 +1173,12 @@ mod tests {
         (root, database, models)
     }
 
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().expect("test path must have parent"))
+            .expect("test parent must be creatable");
+        fs::write(path, b"test").expect("test file must be writable");
+    }
+
     fn median_millis(samples: &mut [Duration]) -> u128 {
         samples.sort_unstable();
         samples[samples.len() / 2].as_millis()
@@ -1249,6 +1231,42 @@ mod tests {
         assert_eq!(selected.ocr_model_id, DEFAULT_OCR_MODEL);
         assert_eq!(selected.embedding_model_id, DEFAULT_EMBEDDING_MODEL);
         assert_eq!(selected.ocr_max_side, DEFAULT_OCR_MAX_SIDE);
+        assert_eq!(selected.visual_model_id, DEFAULT_VISUAL_MODEL);
+        assert_eq!(selected.visual_model_id, MOBILECLIP2_S0);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_default_visual_pack_does_not_require_optional_tagger() -> Result<()> {
+        let (root, database, models) = temporary_paths();
+        db::migrate(&database)?;
+        ensure_defaults(&database, &models)?;
+        let connection = db::connect(&database)?;
+        db::set_setting(&connection, "model_state", "ready")?;
+
+        let ocr_dir = paddle_directory(&models, PPOCRV6_TINY);
+        for name in ["det.onnx", "rec.onnx", "dict.txt"] {
+            touch(&ocr_dir.join(name));
+        }
+        let embedding_dir = models.join("embeddings").join(E5_SMALL);
+        for name in [
+            "model_int8.onnx",
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ] {
+            touch(&embedding_dir.join(name));
+        }
+        let visual_dir = visual_directory(&models, MOBILECLIP2_S0);
+        for name in ["vision_model.onnx", "text_model.onnx", "tokenizer.json"] {
+            touch(&visual_dir.join(name));
+        }
+
+        assert!(model_dir_is_complete(&database, &models));
+        assert!(!is_visual_tagger_installed(&models));
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -1267,6 +1285,7 @@ mod tests {
         let selected = selection(&database)?;
         assert_eq!(selected.ocr_model_id, PPOCRV6_TINY);
         assert_eq!(selected.ocr_max_side, DEFAULT_OCR_MAX_SIDE);
+        assert_eq!(selected.visual_model_id, DEFAULT_VISUAL_MODEL);
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -1285,6 +1304,7 @@ mod tests {
         let selected = selection(&database)?;
         assert_eq!(selected.ocr_model_id, PPOCRV6_TINY);
         assert_eq!(selected.ocr_max_side, DEFAULT_OCR_MAX_SIDE);
+        assert_eq!(selected.visual_model_id, DEFAULT_VISUAL_MODEL);
 
         let _ = fs::remove_dir_all(root);
         Ok(())

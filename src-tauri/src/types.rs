@@ -57,6 +57,8 @@ pub struct VisualDiagnostics {
     pub files_installed: bool,
     /// Runtime successfully loaded into memory (search actually works).
     pub runtime_loaded: bool,
+    pub tagger_files_installed: bool,
+    pub tagger_runtime_loaded: bool,
     pub embedding_dims: Option<usize>,
     pub prompt_bank_loaded: bool,
     /// Last load status message ("loaded" or an error).
@@ -101,6 +103,9 @@ pub struct IndexingStatus {
     pub indexed: i64,
     pub skipped: i64,
     pub failed: i64,
+    pub background_pending: i64,
+    pub background_processing: i64,
+    pub current_stage: Option<String>,
     pub current_file: Option<String>,
 }
 

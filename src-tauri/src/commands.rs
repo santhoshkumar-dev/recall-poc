@@ -1,6 +1,9 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Arc},
+    thread,
+    time::{Duration, Instant},
 };
 
 use arboard::Clipboard;
@@ -303,6 +306,54 @@ pub fn resume_indexing(app: AppHandle, core: State<'_, Arc<AppCore>>) -> Result<
     Ok(())
 }
 
+#[tauri::command]
+pub async fn force_delete_library(core: State<'_, Arc<AppCore>>) -> Result<()> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if core.model_installing.load(Ordering::SeqCst) {
+            return Err(RecallError::Message(
+                "Wait for model installation to finish before force deleting the library.".into(),
+            ));
+        }
+        core.paused.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while core.worker_running.load(Ordering::SeqCst) {
+            if start.elapsed() > Duration::from_secs(120) {
+                return Err(RecallError::Message(
+                    "Timed out waiting for the current indexing job to stop. Try again after the current file finishes.".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        if core.db_path.exists() {
+            fs::remove_file(&core.db_path)?;
+        }
+        for suffix in ["wal", "shm"] {
+            let sidecar = core.db_path.with_extension(format!("db-{suffix}"));
+            if sidecar.exists() {
+                fs::remove_file(sidecar)?;
+            }
+        }
+        if core.thumbnail_dir.exists() {
+            fs::remove_dir_all(&core.thumbnail_dir)?;
+        }
+        fs::create_dir_all(&core.thumbnail_dir)?;
+
+        db::migrate(&core.db_path)?;
+        ai::ensure_defaults(&core.db_path, &core.model_dir)?;
+        if ai::model_dir_is_complete(&core.db_path, &core.model_dir) {
+            ai::set_state(&core.db_path, "ready")?;
+        }
+        let connection = db::connect(&core.db_path)?;
+        db::set_setting(&connection, "queue_paused", "false")?;
+        core.paused.store(false, Ordering::SeqCst);
+        Ok(())
+    })
+    .await
+    .map_err(|error| RecallError::Message(error.to_string()))?
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn retry_failed_job(
     app: AppHandle,
@@ -368,11 +419,13 @@ pub fn get_visual_diagnostics(
     ) = db::visual_counts(&core.db_path, &model_id)?;
     let (images_tagged, visual_tags) =
         db::visual_tag_counts(&core.db_path, crate::ai::VISUAL_TAGGER_GENERAL)?;
-    let status = db::indexing_status(&core.db_path)?;
+    let (pending_jobs, _processing_jobs, failed_jobs) = db::active_job_counts(&core.db_path)?;
     Ok(crate::types::VisualDiagnostics {
         visual_enabled: selection.visual_enabled(),
         files_installed: ai::is_visual_installed(&core.model_dir, &model_id),
         runtime_loaded: runtime.is_some(),
+        tagger_files_installed: ai::is_visual_tagger_installed(&core.model_dir),
+        tagger_runtime_loaded: core.visual_tagger.read().is_some(),
         embedding_dims: runtime.as_ref().map(|r| r.dims()),
         prompt_bank_loaded: core.visual_prompts.read().is_some(),
         load_status: ai::visual_status(&core.db_path),
@@ -385,8 +438,8 @@ pub fn get_visual_diagnostics(
         images_classified,
         images_tagged,
         visual_tags,
-        pending_jobs: status.pending,
-        failed_jobs: status.failed,
+        pending_jobs,
+        failed_jobs,
     })
 }
 
@@ -403,8 +456,8 @@ pub fn reindex_visual_library(
     if core.visual.read().is_none() {
         return Err("The visual-search runtime is not loaded".into());
     }
-    let status = db::indexing_status(&core.db_path)?;
-    if status.processing > 0 || status.pending > 0 {
+    let (pending_jobs, processing_jobs, _failed_jobs) = db::active_job_counts(&core.db_path)?;
+    if processing_jobs > 0 || pending_jobs > 0 {
         return Err(
             "Wait for the current indexing queue to finish before re-indexing visuals".into(),
         );

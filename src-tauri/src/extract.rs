@@ -400,6 +400,15 @@ mod tests {
     }
 
     #[test]
+    fn normal_images_only_use_the_whole_region() {
+        let image = image::RgbImage::new(1200, 900);
+        let regions = image_regions(&image);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].region.kind, "whole");
+        assert_eq!(regions[0].region.region_id, -1);
+    }
+
+    #[test]
     fn wide_images_are_sliced_too() {
         let image = image::RgbImage::new(3000, 900);
         let regions = image_regions(&image);
