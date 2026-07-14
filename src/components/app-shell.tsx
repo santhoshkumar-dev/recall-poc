@@ -2,11 +2,12 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { Library, LockKeyhole, Search, Sparkles } from "lucide-react";
+import { Download, Library, LockKeyhole, Search, Sparkles } from "lucide-react";
 import { recallApi, isTauri } from "@/lib/tauri";
 import type { IndexingEvent, ModelProgressEvent } from "@/lib/types";
 import { useRecallStore } from "@/store/recall-store";
 import { Button } from "./ui/button";
+import { Progress } from "./ui/progress";
 import { ModelSetup } from "./model-setup";
 import { SearchView } from "./search-view";
 import { LibraryView } from "./library-view";
@@ -29,7 +30,7 @@ export function AppShell() {
   const refresh = useCallback(async () => {
     if (!isTauri()) {
       setBootstrap({ databaseReady: true, modelState: "missing", folders: 0, indexedFiles: 0, queuePaused: false });
-      setModel({ state: "missing", progress: 0, message: "Models are not installed", embeddingModel: "all-MiniLM-L6-v2", offlineReady: false });
+      setModel({ state: "missing", progress: 0, message: "Models are not installed", ocrModel: "PP-OCRv6 Tiny", embeddingModel: "Multilingual E5 Small", visualModel: "Disabled", visualEnabled: false, ocrMaxSide: 1600, offlineReady: false });
       setLoading(false);
       return;
     }
@@ -143,9 +144,21 @@ export function AppShell() {
               </button>
             ))}
           </nav>
-          <div className="mt-auto hidden rounded-2xl border border-white/10 bg-white/5 p-4 lg:block">
-            <div className="flex items-center gap-2 text-sm"><Sparkles size={16} className="text-lime" /> On-device AI</div>
-            <p className="mt-2 text-xs leading-5 text-white/45">Your files and queries stay on this computer.</p>
+          <div className="mt-auto space-y-3">
+            {model?.state === "downloading" && (
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                <div className="flex items-center justify-between text-xs font-medium">
+                  <span className="flex items-center gap-2"><Download size={14} className="text-lime animate-pulse" /> Downloading model</span>
+                  <span className="tabular-nums text-white/55">{Math.round(model.progress)}%</span>
+                </div>
+                <Progress value={model.progress} className="mt-2 bg-white/10 [&>div]:bg-lime" />
+                {model.message && <p className="mt-2 truncate text-[11px] leading-4 text-white/45">{model.message}</p>}
+              </div>
+            )}
+            <div className="hidden rounded-2xl border border-white/10 bg-white/5 p-4 lg:block">
+              <div className="flex items-center gap-2 text-sm"><Sparkles size={16} className="text-lime" /> On-device AI</div>
+              <p className="mt-2 text-xs leading-5 text-white/45">Your files and queries stay on this computer.</p>
+            </div>
           </div>
         </aside>
         <main className="min-w-0 p-5 md:p-8 lg:p-10">

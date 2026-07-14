@@ -10,13 +10,35 @@ There is no account, hosted backend, telemetry service, remote inference endpoin
 - Native recursive folder selection and scanning.
 - SQLite persistence with FTS5 and a restart-safe indexing queue.
 - TXT, Markdown, page-preserving text PDF, PNG, JPEG, and WebP extraction.
-- English OCR with `ocrs` and local embeddings with FastEmbed `all-MiniLM-L6-v2`.
+- PP-OCRv6 Tiny at a 1280px cap by default, with local multilingual-e5-small INT8 embeddings.
 - Hybrid ranking: 75% cosine similarity and 25% normalized FTS5/BM25.
 - Exact snippets, PDF page citations, file-type/folder filters, open, reveal, and copy-path actions.
 - Explicit model setup followed by offline operation.
 - Pause/resume, rescan, missing-file reconciliation, isolated failures, and persisted recovery.
 
 Live folder watching, scanned-PDF OCR, generative answers, authentication, cloud sync, and Office formats are intentionally out of scope for this milestone.
+
+## Multimodal retrieval (optional visual search)
+
+Recall can additionally index images with **MobileCLIP2-S0** for visual and cross-modal
+search, kept in a vector space completely separate from the E5 text space.
+
+- **Optional model.** Enable *MobileCLIP2-S0* in Privacy → Developer model lab → *Visual
+  image search model*. It downloads a community ONNX export (paired vision + text encoders,
+  CLIP BPE tokenizer, 512-d, ~290 MB) with pinned SHA256, and runs on the local `ort`
+  runtime. Disabled by default — the app boots and searches text without it.
+- **Four retrieval channels, fused by rank.** Exact text (FTS5), semantic text (E5),
+  visual (MobileCLIP text→image), visual categories (zero-shot prompt bank), plus metadata
+  and filename/folder signals. Channels are normalized independently and combined with
+  intent-aware Reciprocal-Rank Fusion (RRF, k=60); weights vary by detected query intent.
+- **Zero-shot categories.** An editable prompt bank (`src-tauri/src/visual/category_prompts.rs`)
+  scores each image into its top visual categories; used as ranking boosts, never as filters.
+- **Generic metadata + summaries.** Deterministic (no-LLM) extraction of dates, amounts,
+  URLs, emails, phones and identifiers, plus a structured searchable summary embedded with E5.
+- **Explainable results.** Each result shows *why* it matched; a per-query retrieval inspector
+  (toggle in Search) shows per-channel ranks, scores, intents and latency.
+- **Scoped reindexing.** Enabling/switching the visual model regenerates image embeddings and
+  categories only — OCR and document-text embeddings are untouched.
 
 ## Windows prerequisites
 
@@ -50,7 +72,7 @@ Tauri is configured to build both NSIS `.exe` and WiX `.msi` packages. The insta
 
 ## First run
 
-1. Select **Download models**. Recall downloads two compact OCR model files and the FastEmbed model into its application-data directory.
+1. Select **Download models**. Recall downloads the PP-OCRv6 Tiny and multilingual-e5-small INT8 packs into its application-data directory. Interrupted downloads resume automatically.
 2. Choose one or more folders. Only `.txt`, `.md`, `.pdf`, `.png`, `.jpg`, `.jpeg`, and `.webp` files are considered.
 3. Wait for the durable queue to finish, then search in natural language.
 4. Disconnect networking and repeat searches to validate cached offline inference.
@@ -66,6 +88,20 @@ Regenerate binary fixtures with:
 ```powershell
 python scripts/generate_fixtures.py
 ```
+
+## Model benchmarks
+
+The default profile is **PP-OCRv6 Tiny**, a 1280px OCR cap, and **multilingual-e5-small INT8**. It prioritizes bulk indexing speed while the benchmark quality checks ensure that the expected text and retrieval result are still produced.
+
+After installing the model packs, run the local-only benchmarks from `src-tauri`:
+
+```powershell
+$env:RECALL_MODEL_DIR = "$env:APPDATA\com.recall.desktop\models"
+cargo test benchmark_installed_embedding_models --lib -- --ignored --nocapture
+cargo test benchmark_installed_ocr_models --lib -- --ignored --nocapture
+```
+
+The OCR benchmark measures PP-OCRv6 Tiny and Small on `sample-data/restaurant-card.jpg`, checks for “Green Pepper Kitchen”, and prints median latency. The embedding benchmark measures throughput and checks that the restaurant document ranks first for its query. Install Tiny and Small through the Developer model lab before running the OCR comparison.
 
 ## Local data and security
 
@@ -84,7 +120,7 @@ Rust native core
   |-- approved folder scanner + SHA-256 reconciliation
   |-- persistent SQLite job queue
   |-- TXT/Markdown/PDF/image extraction
-  |-- ocrs OCR + FastEmbed ONNX inference
+  |-- PP-OCRv6 Tiny OCR + multilingual-e5-small INT8 inference
   |-- FTS5/BM25 + in-process cosine ranking
   `-- validated Windows open/reveal/clipboard actions
 ```

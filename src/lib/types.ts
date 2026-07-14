@@ -13,8 +13,31 @@ export interface ModelStatus {
   state: ModelState;
   progress: number;
   message: string;
+  ocrModel: string;
   embeddingModel: string;
+  visualModel: string;
+  visualEnabled: boolean;
+  ocrMaxSide: number;
   offlineReady: boolean;
+}
+
+export interface ModelOption {
+  id: string;
+  label: string;
+  description: string;
+  downloadMb: number;
+  recommended: boolean;
+  installed: boolean;
+}
+
+export interface ModelCatalog {
+  ocrModels: ModelOption[];
+  embeddingModels: ModelOption[];
+  visualModels: ModelOption[];
+  activeOcrModelId: string;
+  activeEmbeddingModelId: string;
+  activeVisualModelId: string;
+  ocrMaxSide: number;
 }
 
 export interface WatchedFolder {
@@ -50,6 +73,35 @@ export interface SearchFilters {
   folderId?: string;
 }
 
+export type QueryIntent =
+  | "exact_identifier"
+  | "filename"
+  | "semantic_text"
+  | "visual"
+  | "category"
+  | "date_filtered"
+  | "amount_filtered"
+  | "folder_filtered"
+  | "file_type_filtered"
+  | "mixed";
+
+export type MatchReason =
+  | "exact_text"
+  | "semantic_text"
+  | "visual_similarity"
+  | "visual_category"
+  | "date"
+  | "amount"
+  | "filename"
+  | "folder"
+  | "file_type"
+  | "metadata";
+
+export interface VisualCategory {
+  label: string;
+  score: number;
+}
+
 export interface SearchResult {
   assetId: string;
   filename: string;
@@ -60,6 +112,52 @@ export interface SearchResult {
   semanticScore: number;
   keywordScore: number;
   combinedScore: number;
+  visualScore: number;
+  categoryScore: number;
+  matchReasons: MatchReason[];
+  topCategories: VisualCategory[];
+}
+
+export interface ChannelResult {
+  channel: string;
+  assetId: string;
+  filename: string;
+  rank: number;
+  rawScore: number;
+  normalizedScore: number;
+}
+
+export interface ChannelDiagnostics {
+  channel: string;
+  latencyMs: number;
+  candidateCount: number;
+  results: ChannelResult[];
+}
+
+export interface SearchDebugReport {
+  query: string;
+  intents: QueryIntent[];
+  expandedCategories: string[];
+  appliedFilters: string[];
+  channels: ChannelDiagnostics[];
+  results: SearchResult[];
+  totalLatencyMs: number;
+}
+
+export interface VisualDiagnostics {
+  visualModelId: string;
+  visualEnabled: boolean;
+  filesInstalled: boolean;
+  runtimeLoaded: boolean;
+  embeddingDims?: number;
+  promptBankLoaded: boolean;
+  loadStatus: string;
+  imageAssets: number;
+  imagesIndexed: number;
+  imagesWithEmbeddings: number;
+  imagesClassified: number;
+  pendingJobs: number;
+  failedJobs: number;
 }
 
 export interface ModelProgressEvent {

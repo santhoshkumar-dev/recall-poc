@@ -10,10 +10,10 @@ use tauri::{AppHandle, State};
 use crate::{
     ai, db,
     error::{RecallError, Result},
-    indexer, search,
+    fusion, indexer,
     types::{
-        AssetSummary, BootstrapState, IndexingStatus, ModelStatus, SearchFilters, SearchResult,
-        WatchedFolder,
+        AssetSummary, BootstrapState, IndexingStatus, ModelCatalog, ModelStatus, SearchFilters,
+        SearchResult, WatchedFolder,
     },
     AppCore,
 };
@@ -34,6 +34,140 @@ pub fn get_model_status(core: State<'_, Arc<AppCore>>) -> Result<ModelStatus> {
         return ai::status(&core.db_path);
     }
     Ok(status)
+}
+
+#[tauri::command]
+pub fn get_model_catalog(core: State<'_, Arc<AppCore>>) -> Result<ModelCatalog> {
+    ai::catalog(&core.db_path, &core.model_dir)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn update_model_selection(
+    app: AppHandle,
+    core: State<'_, Arc<AppCore>>,
+    ocr_model_id: String,
+    embedding_model_id: String,
+    ocr_max_side: u32,
+    visual_model_id: Option<String>,
+) -> Result<ModelStatus> {
+    let core = core.inner().clone();
+    let previous = ai::selection(&core.db_path)?;
+    let selected = ai::ModelSelection {
+        ocr_model_id,
+        embedding_model_id,
+        ocr_max_side,
+        visual_model_id: visual_model_id.unwrap_or_else(|| previous.visual_model_id.clone()),
+    };
+    if selected.ocr_model_id == previous.ocr_model_id
+        && selected.embedding_model_id == previous.embedding_model_id
+        && selected.ocr_max_side == previous.ocr_max_side
+        && selected.visual_model_id == previous.visual_model_id
+    {
+        return ai::status(&core.db_path);
+    }
+    if core.model_installing.swap(true, Ordering::SeqCst) {
+        return Err("Model installation is already running".into());
+    }
+
+    let was_paused = core.paused.swap(true, Ordering::SeqCst);
+    let processing = match db::indexing_status(&core.db_path) {
+        Ok(status) => status.processing,
+        Err(error) => {
+            core.paused.store(was_paused, Ordering::SeqCst);
+            core.model_installing.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
+    };
+    if processing > 0 {
+        core.paused.store(was_paused, Ordering::SeqCst);
+        core.model_installing.store(false, Ordering::SeqCst);
+        return Err(
+            "Wait for the current file to finish, or pause indexing, before changing models."
+                .into(),
+        );
+    }
+
+    let app_for_work = app.clone();
+    let install_core = core.clone();
+    let selected_for_work = selected.clone();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        ai::install_selection(
+            &app_for_work,
+            &install_core.db_path,
+            &install_core.model_dir,
+            &selected_for_work,
+        )
+    })
+    .await;
+    core.model_installing.store(false, Ordering::SeqCst);
+
+    let result = match task {
+        Ok(result) => result,
+        Err(error) => {
+            core.paused.store(was_paused, Ordering::SeqCst);
+            return Err(RecallError::Message(error.to_string()));
+        }
+    };
+    match result {
+        Ok(runtime) => {
+            let ocr_changed = selected.ocr_model_id != previous.ocr_model_id
+                || selected.ocr_max_side != previous.ocr_max_side;
+            let embedding_changed = selected.embedding_model_id != previous.embedding_model_id;
+            let visual_changed = selected.visual_model_id != previous.visual_model_id;
+            *core.ai.write() = Some(runtime);
+
+            // Swap the visual runtime to match the new selection (load errors
+            // are non-fatal: text search continues). Drop the cached prompt bank
+            // so it rebuilds for the new model / prompt version.
+            match ai::load_visual_for_selection(&core.model_dir, &selected) {
+                Ok(Some(runtime)) => {
+                    eprintln!("[visual] runtime loaded (dims={})", runtime.dims());
+                    ai::set_visual_status(&core.db_path, "loaded");
+                    *core.visual.write() = Some(runtime);
+                }
+                Ok(None) => {
+                    *core.visual.write() = None;
+                    ai::set_visual_status(&core.db_path, "disabled");
+                }
+                Err(error) => {
+                    eprintln!("[visual] runtime FAILED to load: {error}");
+                    ai::set_visual_status(&core.db_path, &format!("load error: {error}"));
+                    *core.visual.write() = None;
+                }
+            }
+            *core.visual_prompts.write() = None;
+
+            if let Err(error) =
+                db::queue_model_reindex(&core.db_path, ocr_changed, embedding_changed)
+            {
+                core.paused.store(was_paused, Ordering::SeqCst);
+                return Err(error);
+            }
+            // If only the visual model changed, re-embed image assets only
+            // (never text/E5). A full embedding reindex already covers images.
+            if visual_changed && !embedding_changed && selected.visual_enabled() {
+                if let Err(error) = db::queue_visual_reindex(&core.db_path, "visual") {
+                    core.paused.store(was_paused, Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
+            core.paused.store(was_paused, Ordering::SeqCst);
+            if !was_paused {
+                indexer::start_worker(app, core.clone());
+            }
+            ai::status(&core.db_path)
+        }
+        Err(error) => {
+            core.paused.store(was_paused, Ordering::SeqCst);
+            if core.ai.read().is_some() {
+                let _ = ai::set_state(&core.db_path, "ready");
+                let _ = ai::set_last_error(&core.db_path, &error.to_string());
+            } else {
+                let _ = ai::set_error(&core.db_path, &error.to_string());
+            }
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -63,7 +197,12 @@ pub async fn install_models(app: AppHandle, core: State<'_, Arc<AppCore>>) -> Re
             ai::status(&core.db_path)
         }
         Err(error) => {
-            let _ = ai::set_error(&core.db_path, &error.to_string());
+            if core.ai.read().is_some() {
+                let _ = ai::set_state(&core.db_path, "ready");
+                let _ = ai::set_last_error(&core.db_path, &error.to_string());
+            } else {
+                let _ = ai::set_error(&core.db_path, &error.to_string());
+            }
             Err(error)
         }
     }
@@ -167,7 +306,43 @@ pub fn search_files(
     query: String,
     filters: SearchFilters,
 ) -> Result<Vec<SearchResult>> {
-    search::search(&core, &query, &filters)
+    fusion::search(&core, &query, &filters)
+}
+
+#[tauri::command]
+pub fn search_files_debug(
+    core: State<'_, Arc<AppCore>>,
+    query: String,
+    filters: SearchFilters,
+) -> Result<crate::types::SearchDebugReport> {
+    fusion::search_debug(&core, &query, &filters)
+}
+
+#[tauri::command]
+pub fn get_visual_diagnostics(
+    core: State<'_, Arc<AppCore>>,
+) -> Result<crate::types::VisualDiagnostics> {
+    let selection = ai::selection(&core.db_path)?;
+    let model_id = selection.visual_model_id.clone();
+    let runtime = core.visual.read().clone();
+    let (image_assets, images_indexed, images_with_embeddings, images_classified) =
+        db::visual_counts(&core.db_path, &model_id)?;
+    let status = db::indexing_status(&core.db_path)?;
+    Ok(crate::types::VisualDiagnostics {
+        visual_enabled: selection.visual_enabled(),
+        files_installed: ai::is_visual_installed(&core.model_dir, &model_id),
+        runtime_loaded: runtime.is_some(),
+        embedding_dims: runtime.as_ref().map(|r| r.dims()),
+        prompt_bank_loaded: core.visual_prompts.read().is_some(),
+        load_status: ai::visual_status(&core.db_path),
+        visual_model_id: model_id,
+        image_assets,
+        images_indexed,
+        images_with_embeddings,
+        images_classified,
+        pending_jobs: status.pending,
+        failed_jobs: status.failed,
+    })
 }
 
 #[tauri::command(rename_all = "camelCase")]

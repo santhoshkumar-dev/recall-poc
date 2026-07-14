@@ -10,6 +10,8 @@ pub enum RecallError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 

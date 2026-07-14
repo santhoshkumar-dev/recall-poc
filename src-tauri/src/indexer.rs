@@ -202,7 +202,7 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
                 Ok(value) => value,
                 Err(_) => break,
             };
-            let Some((job_id, asset)) = next else {
+            let Some((job_id, stage, asset)) = next else {
                 break;
             };
             let _ = app.emit(
@@ -216,6 +216,33 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
                     message: None,
                 },
             );
+
+            // Visual-only stages reuse existing text chunks and only refresh the
+            // image embedding / classification / metadata.
+            if stage == "visual" || stage == "recategorize" {
+                match run_visual_pass(&core, &asset, &stage) {
+                    Ok(()) => {
+                        let _ = db::mark_job(
+                            &core.db_path,
+                            &job_id,
+                            &asset.id,
+                            "indexed",
+                            None,
+                        );
+                        emit_completed(&app, &asset);
+                    }
+                    Err(error) => fail(
+                        &app,
+                        &core,
+                        &job_id,
+                        &asset.id,
+                        &asset.filename,
+                        error.to_string(),
+                    ),
+                }
+                continue;
+            }
+
             let ai = core.ai.read().clone();
             match extract::process_file(
                 Path::new(&asset.absolute_path),
@@ -227,17 +254,15 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
                 Ok(ProcessOutcome::Chunks(chunks)) => {
                     match db::save_chunks(&core.db_path, &job_id, &asset.id, &chunks) {
                         Ok(()) => {
-                            let _ = app.emit(
-                                "indexing://file-completed",
-                                IndexingEvent {
-                                    folder_id: Some(asset.folder_id),
-                                    asset_id: Some(asset.id),
-                                    filename: Some(asset.filename),
-                                    completed: None,
-                                    total: None,
-                                    message: None,
-                                },
-                            );
+                            // Full index: also produce visual artifacts for images.
+                            if let Err(error) = run_visual_pass(&core, &asset, "index") {
+                                eprintln!("Visual pass failed for {}: {error}", asset.filename);
+                            }
+                            // Generic metadata + structured searchable summary.
+                            if let Err(error) = run_text_enrichment(&app, &core, &asset) {
+                                eprintln!("Metadata pass failed for {}: {error}", asset.filename);
+                            }
+                            emit_completed(&app, &asset);
                         }
                         Err(error) => fail(
                             &app,
@@ -250,8 +275,42 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
                     }
                 }
                 Ok(ProcessOutcome::Skipped(reason)) => {
-                    let _ =
-                        db::mark_job(&core.db_path, &job_id, &asset.id, "skipped", Some(&reason));
+                    // A photo with no OCR text is still visually searchable when
+                    // a visual model is enabled: embed + classify it and index.
+                    if is_image_extension(&asset.extension) && core.visual.read().is_some() {
+                        // Clear any stale chunks and mark indexed (empty text),
+                        // then attach the image embedding + summary.
+                        match db::save_chunks(&core.db_path, &job_id, &asset.id, &[]) {
+                            Ok(()) => {
+                                if let Err(error) = run_visual_pass(&core, &asset, "index") {
+                                    eprintln!("Visual pass failed for {}: {error}", asset.filename);
+                                }
+                                if let Err(error) = run_text_enrichment(&app, &core, &asset) {
+                                    eprintln!(
+                                        "Metadata pass failed for {}: {error}",
+                                        asset.filename
+                                    );
+                                }
+                                emit_completed(&app, &asset);
+                            }
+                            Err(error) => fail(
+                                &app,
+                                &core,
+                                &job_id,
+                                &asset.id,
+                                &asset.filename,
+                                error.to_string(),
+                            ),
+                        }
+                    } else {
+                        let _ = db::mark_job(
+                            &core.db_path,
+                            &job_id,
+                            &asset.id,
+                            "skipped",
+                            Some(&reason),
+                        );
+                    }
                 }
                 Ok(ProcessOutcome::ModelRequired) => {
                     let _ = db::mark_job(
@@ -308,6 +367,144 @@ fn fail(
             message: Some(message),
         },
     );
+}
+
+fn is_image_extension(extension: &str) -> bool {
+    matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp")
+}
+
+fn emit_completed(app: &AppHandle, asset: &crate::types::AssetRecord) {
+    let _ = app.emit(
+        "indexing://file-completed",
+        IndexingEvent {
+            folder_id: Some(asset.folder_id.clone()),
+            asset_id: Some(asset.id.clone()),
+            filename: Some(asset.filename.clone()),
+            completed: None,
+            total: None,
+            message: None,
+        },
+    );
+}
+
+/// Produce/refresh visual artifacts for an image asset: MobileCLIP image
+/// embedding (Phase 2), category classification (Phase 3) and generic metadata
+/// (Phase 5). No-op when the asset is not an image or visual search is off.
+///
+/// `stage` = "recategorize" recomputes categories from the cached embedding
+/// only (no image encoder rerun); "visual"/"index" (re)embed the pixels.
+fn run_visual_pass(core: &AppCore, asset: &crate::types::AssetRecord, stage: &str) -> Result<()> {
+    if !is_image_extension(&asset.extension) {
+        return Ok(());
+    }
+    let visual = core.visual.read().clone();
+    let Some(runtime) = visual else {
+        return Ok(());
+    };
+    let selection = crate::ai::selection(&core.db_path)?;
+    let model_id = selection.visual_model_id.clone();
+    let bank = prompt_bank(core, &runtime, &model_id)?;
+
+    // Reuse the cached image embedding when only re-categorizing.
+    let embedding = if stage == "recategorize" {
+        match db::image_embedding_for(&core.db_path, &asset.id, &model_id)? {
+            Some(existing) => existing,
+            None => {
+                let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
+                let vec = runtime.embed_image(&image)?;
+                db::save_image_embedding(
+                    &core.db_path,
+                    &asset.id,
+                    &model_id,
+                    crate::ai::VISUAL_MODEL_VERSION,
+                    db::WHOLE_IMAGE_PAGE,
+                    &vec,
+                )?;
+                vec
+            }
+        }
+    } else {
+        let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
+        let vec = runtime.embed_image(&image)?;
+        drop(image);
+        db::save_image_embedding(
+            &core.db_path,
+            &asset.id,
+            &model_id,
+            crate::ai::VISUAL_MODEL_VERSION,
+            db::WHOLE_IMAGE_PAGE,
+            &vec,
+        )?;
+        vec
+    };
+
+    // Classify into top visual categories (ranking signal, not a filter).
+    let categories = bank.classify(&embedding);
+    db::save_visual_classifications(&core.db_path, &asset.id, &model_id, &categories)?;
+    let top = categories
+        .first()
+        .map(|c| format!("{} {:.2}", c.label, c.score))
+        .unwrap_or_else(|| "none".into());
+    eprintln!(
+        "[visual] embedded {} (dims={}, top category: {})",
+        asset.filename,
+        embedding.len(),
+        top
+    );
+    Ok(())
+}
+
+/// Extract generic metadata and build a deterministic structured summary for
+/// an asset (any type), persisting metadata and appending an E5-embedded
+/// summary chunk. Runs only on a full `index`.
+fn run_text_enrichment(_app: &AppHandle, core: &AppCore, asset: &crate::types::AssetRecord) -> Result<()> {
+    let text = db::asset_text(&core.db_path, &asset.id)?;
+    let meta = crate::metadata::extract(&text, &asset.filename);
+    db::save_asset_metadata(&core.db_path, &asset.id, &meta)?;
+
+    // Visual categories (if classified) enrich the summary.
+    let categories: Vec<String> = {
+        let selection = crate::ai::selection(&core.db_path)?;
+        if selection.visual_enabled() && is_image_extension(&asset.extension) {
+            db::classifications_for(&core.db_path, &asset.id, &selection.visual_model_id)?
+                .into_iter()
+                .take(3)
+                .map(|c| c.label)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+
+    let summary = crate::metadata::structured_summary(&asset.filename, &categories, &meta, &text);
+    if summary.trim().is_empty() {
+        return Ok(());
+    }
+    let ai = core.ai.read().clone();
+    let embedding = match ai.as_ref() {
+        Some(runtime) => runtime
+            .embed_documents(vec![summary.clone()])?
+            .into_iter()
+            .next(),
+        None => None,
+    };
+    db::append_chunk(&core.db_path, &asset.id, &summary, embedding.as_deref())?;
+    Ok(())
+}
+
+/// Fetch (or lazily build + cache) the prompt-embedding bank for classification.
+fn prompt_bank(
+    core: &AppCore,
+    runtime: &crate::visual::VisualRuntime,
+    model_id: &str,
+) -> Result<Arc<crate::visual::PromptBank>> {
+    if let Some(bank) = core.visual_prompts.read().clone() {
+        return Ok(bank);
+    }
+    let dir = crate::ai::visual_directory(&core.model_dir, model_id);
+    let built = Arc::new(crate::visual::PromptBank::load_or_build(runtime, &dir)?);
+    *core.visual_prompts.write() = Some(built.clone());
+    Ok(built)
 }
 
 fn event_for_folder(folder_id: &str, message: &str) -> IndexingEvent {

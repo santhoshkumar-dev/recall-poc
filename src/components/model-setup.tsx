@@ -15,7 +15,7 @@ export function ModelSetup({ onComplete }: { onComplete: () => Promise<void> }) 
   const install = async () => {
     setError(undefined);
     if (!isTauri()) {
-      setModel({ state: "ready", progress: 100, message: "Preview mode", embeddingModel: "all-MiniLM-L6-v2", offlineReady: true });
+      setModel({ state: "ready", progress: 100, message: "Preview mode", ocrModel: "PP-OCRv6 Tiny", embeddingModel: "Multilingual E5 Small", visualModel: "Disabled", visualEnabled: false, ocrMaxSide: 1280, offlineReady: true });
       return;
     }
     try { setModel(await recallApi.installModels()); await onComplete(); }
@@ -46,8 +46,9 @@ export function ModelSetup({ onComplete }: { onComplete: () => Promise<void> }) 
           <p className="eyebrow !text-white/35">Set up in two steps</p>
           <div className="mt-8 space-y-5">
             <div className={`rounded-3xl border p-6 ${ready ? "border-lime/40 bg-lime/10" : "border-white/10 bg-white/5"}`}>
-              <div className="flex items-start gap-4"><div className="flex h-10 w-10 items-center justify-center rounded-full bg-lime font-bold text-ink">1</div><div className="flex-1"><h2 className="text-lg font-semibold">Install local intelligence</h2><p className="mt-2 text-sm leading-6 text-white/50">Downloads compact English OCR and embedding models once. Files and queries are never part of the download.</p></div></div>
+              <div className="flex items-start gap-4"><div className="flex h-10 w-10 items-center justify-center rounded-full bg-lime font-bold text-ink">1</div><div className="flex-1"><h2 className="text-lg font-semibold">Install local intelligence</h2><p className="mt-2 text-sm leading-6 text-white/50">Downloads compact multilingual OCR and embedding models once. Files and queries are never part of the download.</p></div></div>
               {model?.state === "downloading" && <div className="mt-5"><Progress value={model.progress} className="bg-white/10 [&>div]:bg-lime" /><p className="mt-2 text-xs text-white/45">{model.message}</p></div>}
+              {model?.state === "error" && !error && <p className="mt-5 rounded-2xl bg-red-500/15 p-4 text-sm text-red-200">{model.message}</p>}
               <Button className="mt-5 w-full bg-lime text-ink hover:bg-lime/80" disabled={model?.state === "downloading" || ready} onClick={() => void install()}>{ready ? <><Check size={17} /> Models ready</> : <><Wifi size={17} /> Download models</>}</Button>
             </div>
             <div className={`rounded-3xl border p-6 ${ready ? "border-white/15 bg-white/5" : "border-white/10 bg-white/5"}`}>

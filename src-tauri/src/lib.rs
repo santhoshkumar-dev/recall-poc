@@ -3,17 +3,18 @@ mod commands;
 mod db;
 mod error;
 mod extract;
+mod fusion;
 mod indexer;
+mod metadata;
+mod query_intent;
 mod search;
 mod types;
+mod visual;
 
 use std::{
     fs,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
 };
 
 use ai::AiRuntime;
@@ -28,6 +29,11 @@ pub struct AppCore {
     pub worker_running: AtomicBool,
     pub model_installing: AtomicBool,
     pub ai: RwLock<Option<Arc<AiRuntime>>>,
+    /// Optional visual (MobileCLIP2) runtime — separate space from `ai`.
+    pub visual: RwLock<Option<Arc<visual::VisualRuntime>>>,
+    /// Cached zero-shot prompt embeddings; rebuilt when the visual model or
+    /// prompt bank changes.
+    pub visual_prompts: RwLock<Option<Arc<visual::PromptBank>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -44,19 +50,61 @@ pub fn run() {
             fs::create_dir_all(&thumbnail_dir)?;
             let db_path = data_dir.join("recall.db");
             db::migrate(&db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            ai::ensure_defaults(&db_path, &model_dir)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
             let connection = db::connect(&db_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             let paused = db::setting(&connection, "queue_paused", "false")
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?
                 == "true";
-            let runtime = if ai::model_dir_is_complete(&model_dir) {
-                AiRuntime::load(&model_dir).ok().map(Arc::new)
+
+            let runtime = if ai::model_dir_is_complete(&db_path, &model_dir) {
+                match ai::selection(&db_path)
+                    .and_then(|selected| AiRuntime::load_for_selection(&model_dir, &selected))
+                {
+                    Ok(runtime) => Some(Arc::new(runtime)),
+                    Err(error) => {
+                        ai::set_error(
+                            &db_path,
+                            &format!("Installed models could not be loaded: {error}"),
+                        )
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                        None
+                    }
+                }
             } else {
                 None
             };
-            if runtime.is_some() {
-                ai::set_state(&db_path, "ready")
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            } else if db::setting(&connection, "model_state", "missing")
+
+            // Optional visual runtime; failure here must NOT block text search.
+            let visual_runtime = match ai::selection(&db_path)
+                .and_then(|selected| ai::load_visual_for_selection(&model_dir, &selected))
+            {
+                Ok(Some(runtime)) => {
+                    eprintln!("[visual] runtime loaded (dims={})", runtime.dims());
+                    ai::set_visual_status(&db_path, "loaded");
+                    Some(runtime)
+                }
+                Ok(None) => {
+                    let selected = ai::selection(&db_path).ok();
+                    let enabled = selected.map(|s| s.visual_enabled()).unwrap_or(false);
+                    let msg = if enabled {
+                        "enabled but model files are missing"
+                    } else {
+                        "disabled"
+                    };
+                    eprintln!("[visual] runtime not loaded: {msg}");
+                    ai::set_visual_status(&db_path, msg);
+                    None
+                }
+                Err(error) => {
+                    eprintln!("[visual] runtime FAILED to load: {error}");
+                    ai::set_visual_status(&db_path, &format!("load error: {error}"));
+                    None
+                }
+            };
+
+            if db::setting(&connection, "model_state", "missing")
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?
                 == "downloading"
             {
@@ -66,6 +114,7 @@ pub fn run() {
                 )
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             }
+
             let core = Arc::new(AppCore {
                 db_path,
                 model_dir,
@@ -74,6 +123,8 @@ pub fn run() {
                 worker_running: AtomicBool::new(false),
                 model_installing: AtomicBool::new(false),
                 ai: RwLock::new(runtime),
+                visual: RwLock::new(visual_runtime),
+                visual_prompts: RwLock::new(None),
             });
             app.manage(core.clone());
             if !paused {
@@ -84,7 +135,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
             commands::get_model_status,
+            commands::get_model_catalog,
             commands::install_models,
+            commands::update_model_selection,
             commands::choose_folders,
             commands::list_watched_folders,
             commands::remove_watched_folder,
@@ -95,6 +148,8 @@ pub fn run() {
             commands::get_indexing_status,
             commands::list_recent_assets,
             commands::search_files,
+            commands::search_files_debug,
+            commands::get_visual_diagnostics,
             commands::open_source_file,
             commands::reveal_source_file,
             commands::copy_source_path,

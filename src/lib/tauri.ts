@@ -3,9 +3,12 @@ import type {
   AssetSummary,
   BootstrapState,
   IndexingStatus,
+  ModelCatalog,
   ModelStatus,
+  SearchDebugReport,
   SearchFilters,
   SearchResult,
+  VisualDiagnostics,
   WatchedFolder,
 } from "./types";
 
@@ -19,7 +22,20 @@ async function desktopInvoke<T>(command: string, args?: Record<string, unknown>)
 export const recallApi = {
   bootstrap: () => desktopInvoke<BootstrapState>("get_bootstrap_state"),
   modelStatus: () => desktopInvoke<ModelStatus>("get_model_status"),
+  modelCatalog: () => desktopInvoke<ModelCatalog>("get_model_catalog"),
   installModels: () => desktopInvoke<ModelStatus>("install_models"),
+  updateModelSelection: (
+    ocrModelId: string,
+    embeddingModelId: string,
+    ocrMaxSide: number,
+    visualModelId?: string,
+  ) =>
+    desktopInvoke<ModelStatus>("update_model_selection", {
+      ocrModelId,
+      embeddingModelId,
+      ocrMaxSide,
+      visualModelId,
+    }),
   chooseFolders: () => desktopInvoke<WatchedFolder[]>("choose_folders"),
   folders: () => desktopInvoke<WatchedFolder[]>("list_watched_folders"),
   removeFolder: (folderId: string) => desktopInvoke<void>("remove_watched_folder", { folderId }),
@@ -31,6 +47,9 @@ export const recallApi = {
   recentAssets: (limit = 20) => desktopInvoke<AssetSummary[]>("list_recent_assets", { limit }),
   search: (query: string, filters: SearchFilters) =>
     desktopInvoke<SearchResult[]>("search_files", { query, filters }),
+  searchDebug: (query: string, filters: SearchFilters) =>
+    desktopInvoke<SearchDebugReport>("search_files_debug", { query, filters }),
+  visualDiagnostics: () => desktopInvoke<VisualDiagnostics>("get_visual_diagnostics"),
   open: (assetId: string) => desktopInvoke<void>("open_source_file", { assetId }),
   reveal: (assetId: string) => desktopInvoke<void>("reveal_source_file", { assetId }),
   copyPath: (assetId: string) => desktopInvoke<void>("copy_source_path", { assetId }),
