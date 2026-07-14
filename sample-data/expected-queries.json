@@ -1,0 +1,29 @@
+[
+  {
+    "query": "What time is my train to Bengaluru?",
+    "expectedFile": "ticket-and-receipt.pdf",
+    "expectedPage": 1,
+    "expectedPhrase": "Friday, 22:15"
+  },
+  {
+    "query": "When does the SSD warranty expire?",
+    "expectedFile": "ticket-and-receipt.pdf",
+    "expectedPage": 2,
+    "expectedPhrase": "12 July 2029"
+  },
+  {
+    "query": "What restaurant did Anika recommend?",
+    "expectedFile": "restaurant-card.jpg",
+    "expectedPhrase": "Green Pepper Kitchen"
+  },
+  {
+    "query": "Which prototype works without internet?",
+    "expectedFile": "project-memory.md",
+    "expectedPhrase": "continue working after Wi-Fi is disconnected"
+  },
+  {
+    "query": "What do I need for lemon rice?",
+    "expectedFile": "dinner-plan.md",
+    "expectedPhrase": "lemons, curry leaves, peanuts"
+  }
+]
