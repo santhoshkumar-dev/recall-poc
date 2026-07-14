@@ -4589,6 +4589,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "chrono",
+ "csv",
  "fastembed",
  "image",
  "kamadak-exif",

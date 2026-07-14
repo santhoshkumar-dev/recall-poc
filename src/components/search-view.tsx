@@ -12,6 +12,7 @@ const MATCH_REASON_LABEL: Record<MatchReason, string> = {
   exact_text: "Exact text",
   semantic_text: "Semantic text",
   visual_similarity: "Visual match",
+  visual_tag: "Visual tag",
   visual_category: "Visual category",
   date: "Date",
   amount: "Amount",
@@ -19,6 +20,8 @@ const MATCH_REASON_LABEL: Record<MatchReason, string> = {
   folder: "Folder",
   file_type: "File type",
   metadata: "Metadata",
+  document_type: "Document type",
+  entity: "Entity",
 };
 
 export function SearchView() {
@@ -86,6 +89,8 @@ function Inspector({ report }: { report: SearchDebugReport }) {
       </div>
       <div className="mt-3 flex flex-wrap gap-4">
         <div><span className="text-black/45">Intents:</span> {report.intents.length ? report.intents.map((i) => <Badge key={i}>{i}</Badge>) : <span className="text-black/40">none</span>}</div>
+        <div><span className="text-black/45">Visual query:</span> {report.visualQuery ? "yes" : "no"}</div>
+        {report.visualPrompts.length > 0 && <div><span className="text-black/45">Visual prompts:</span> {report.visualPrompts.join(" · ")}</div>}
         {report.expandedCategories.length > 0 && <div><span className="text-black/45">Categories:</span> {report.expandedCategories.map((c) => <Badge key={c} tone="neutral">{c}</Badge>)}</div>}
         {report.appliedFilters.length > 0 && <div><span className="text-black/45">Filters:</span> {report.appliedFilters.join("; ")}</div>}
       </div>
@@ -102,15 +107,35 @@ function Inspector({ report }: { report: SearchDebugReport }) {
           </div>
         ))}
       </div>
+      {report.results.some((result) => result.visualScore > 0 || result.topVisualTags.length > 0) && (
+        <div className="mt-4 overflow-x-auto rounded-xl border border-black/10 bg-white p-3">
+          <p className="font-medium">Qualified visual evidence</p>
+          <div className="mt-2 space-y-1 text-xs text-black/60">
+            {report.results.slice(0, 8).map((result) => (
+              <div key={result.assetId} className="grid min-w-[860px] grid-cols-[1fr_repeat(5,90px)_170px] gap-2">
+                <span className="truncate">{result.filename}</span>
+                <span>cos {result.visualScore.toFixed(3)}</span>
+                <span>z {result.visualZScore.toFixed(2)}</span>
+                <span>region {result.visualRegionId ?? "-"}</span>
+                <span>cat+ {result.categoryPositiveScore.toFixed(3)}</span>
+                <span>margin {result.categoryScore.toFixed(3)}</span>
+                <span className="truncate">
+                  tags {result.topVisualTags.slice(0, 3).map((tag) => tag.label).join(", ") || "-"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   );
 }
 
 function ResultCard({ result }: { result: SearchResult }) {
-  const pct = Math.round(result.combinedScore * 100);
+  const confidenceLabel = result.confidence === "strong" ? "Strong match" : "Moderate match";
   return (
     <article className="panel p-6 transition hover:-translate-y-0.5 hover:bg-white">
-      <div className="flex items-start gap-4"><div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-lime/50"><FileText size={22} /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h2 className="truncate text-lg font-semibold">{result.filename}</h2><Badge>{result.extension?.toUpperCase() ?? "FILE"}</Badge>{result.pageNumber && <Badge>Page {result.pageNumber}</Badge>}<Badge tone={pct >= 70 ? "good" : "neutral"}>{pct}% match</Badge></div><p className="mt-1 truncate text-xs text-black/40">{result.sourcePath}</p>{result.matchReasons?.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-1.5"><span className="text-xs text-black/40">Matched because:</span>{result.matchReasons.map((reason) => <Badge key={reason} tone="neutral">{MATCH_REASON_LABEL[reason]}</Badge>)}</div>}<p className="mt-4 max-w-4xl text-sm leading-7 text-black/65">{result.snippet}</p><div className="mt-5 flex flex-wrap gap-2"><Button size="sm" onClick={() => void recallApi.open(result.assetId)}><ExternalLink size={15} /> Open</Button><Button size="sm" variant="secondary" onClick={() => void recallApi.reveal(result.assetId)}><FolderSearch size={15} /> Show in folder</Button><Button size="sm" variant="ghost" onClick={() => void recallApi.copyPath(result.assetId)}><Clipboard size={15} /> Copy path</Button></div></div></div>
+      <div className="flex items-start gap-4"><div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-lime/50"><FileText size={22} /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h2 className="truncate text-lg font-semibold">{result.filename}</h2><Badge>{result.extension?.toUpperCase() ?? "FILE"}</Badge>{result.pageNumber && <Badge>Page {result.pageNumber}</Badge>}<Badge tone={result.confidence === "strong" ? "good" : "neutral"}>{confidenceLabel}</Badge></div><p className="mt-1 truncate text-xs text-black/40">{result.sourcePath}</p>{result.matchReasons?.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-1.5"><span className="text-xs text-black/40">Matched because:</span>{result.matchReasons.map((reason) => <Badge key={reason} tone="neutral">{MATCH_REASON_LABEL[reason]}</Badge>)}</div>}{result.topVisualTags.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-1.5"><span className="text-xs text-black/40">Visual tags:</span>{result.topVisualTags.slice(0, 5).map((tag) => <Badge key={`${tag.regionId}-${tag.label}`} tone="neutral">{tag.label}</Badge>)}</div>}<p className="mt-4 max-w-4xl text-sm leading-7 text-black/65">{result.snippet}</p><div className="mt-5 flex flex-wrap gap-2"><Button size="sm" onClick={() => void recallApi.open(result.assetId)}><ExternalLink size={15} /> Open</Button><Button size="sm" variant="secondary" onClick={() => void recallApi.reveal(result.assetId)}><FolderSearch size={15} /> Show in folder</Button><Button size="sm" variant="ghost" onClick={() => void recallApi.copyPath(result.assetId)}><Clipboard size={15} /> Copy path</Button></div></div></div>
     </article>
   );
 }

@@ -21,7 +21,9 @@ use crate::{
     AppCore,
 };
 
-const SUPPORTED: &[&str] = &["txt", "md", "pdf", "png", "jpg", "jpeg", "webp"];
+const SUPPORTED: &[&str] = &[
+    "txt", "md", "pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff",
+];
 const EXCLUDED: &[&str] = &[
     ".git",
     "node_modules",
@@ -125,19 +127,42 @@ pub fn scan_folder(app: &AppHandle, core: &Arc<AppCore>, folder_id: &str) -> Res
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
+        // A disappeared path with the same digest is a rename/move, not a new
+        // asset. Reuse its asset id (and therefore chunks/embeddings) while the
+        // content_items row remains the stable identity.
+        let moved: Option<(String, String)> = if existing.is_none() {
+            connection.query_row(
+                "SELECT id,status FROM assets WHERE folder_id=?1 AND sha256=?2 AND available=0 ORDER BY indexed_at DESC LIMIT 1",
+                params![folder_id, digest],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?
+        } else {
+            None
+        };
         let changed = existing
             .as_ref()
             .map(|(_, hash, status)| {
                 hash.as_deref() != Some(digest.as_str()) || status != "indexed"
             })
+            .or_else(|| moved.as_ref().map(|(_, status)| status != "indexed"))
             .unwrap_or(true);
+        let content_id = db::ensure_content_item(&connection, &digest)?;
         let asset_id = existing
-            .map(|value| value.0)
+            .as_ref()
+            .map(|value| value.0.clone())
+            .or_else(|| moved.as_ref().map(|value| value.0.clone()))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        connection.execute(r#"INSERT INTO assets(id,folder_id,absolute_path,relative_path,filename,extension,mime_type,size_bytes,modified_at,sha256,status,available)
-          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'pending',1)
-          ON CONFLICT(absolute_path) DO UPDATE SET folder_id=excluded.folder_id,relative_path=excluded.relative_path,filename=excluded.filename,extension=excluded.extension,mime_type=excluded.mime_type,size_bytes=excluded.size_bytes,modified_at=excluded.modified_at,sha256=excluded.sha256,available=1,status=CASE WHEN assets.sha256<>excluded.sha256 THEN 'pending' ELSE assets.status END"#,
-          params![asset_id,folder_id,absolute,relative,entry.file_name().to_string_lossy(),extension,mime_guess::from_path(entry.path()).first_or_octet_stream().essence_str(),metadata.len() as i64,modified,digest])?;
+        if moved.is_some() {
+            connection.execute(
+                "UPDATE assets SET absolute_path=?2,relative_path=?3,filename=?4,extension=?5,mime_type=?6,size_bytes=?7,modified_at=?8,content_id=?9,available=1 WHERE id=?1",
+                params![asset_id,absolute,relative,entry.file_name().to_string_lossy(),extension,mime_guess::from_path(entry.path()).first_or_octet_stream().essence_str(),metadata.len() as i64,modified,content_id],
+            )?;
+        } else {
+            connection.execute(r#"INSERT INTO assets(id,folder_id,absolute_path,relative_path,filename,extension,mime_type,size_bytes,modified_at,sha256,content_id,status,available)
+              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'pending',1)
+              ON CONFLICT(absolute_path) DO UPDATE SET folder_id=excluded.folder_id,relative_path=excluded.relative_path,filename=excluded.filename,extension=excluded.extension,mime_type=excluded.mime_type,size_bytes=excluded.size_bytes,modified_at=excluded.modified_at,sha256=excluded.sha256,content_id=excluded.content_id,available=1,status=CASE WHEN assets.sha256<>excluded.sha256 THEN 'pending' ELSE assets.status END"#,
+              params![asset_id,folder_id,absolute,relative,entry.file_name().to_string_lossy(),extension,mime_guess::from_path(entry.path()).first_or_octet_stream().essence_str(),metadata.len() as i64,modified,digest,content_id])?;
+        }
         if changed {
             let now = Utc::now().to_rfc3339();
             connection.execute("INSERT INTO indexing_jobs(id,asset_id,stage,state,created_at,updated_at) VALUES (?1,?2,'index','pending',?3,?3) ON CONFLICT(asset_id) DO UPDATE SET state='pending',error_message=NULL,updated_at=excluded.updated_at", params![Uuid::new_v4().to_string(),asset_id,now])?;
@@ -203,7 +228,15 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
                 Err(_) => break,
             };
             let Some((job_id, stage, asset)) = next else {
-                break;
+                let stage_job = match db::claim_next_extraction_stage_job(&core.db_path) {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                let Some((stage_job_id, stage_name, stage_asset)) = stage_job else {
+                    break;
+                };
+                process_extraction_stage(&app, &core, &stage_job_id, &stage_name, &stage_asset);
+                continue;
             };
             let _ = app.emit(
                 "indexing://file-started",
@@ -222,16 +255,10 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
             if stage == "visual" || stage == "recategorize" {
                 match run_visual_pass(&core, &asset, &stage) {
                     Ok(()) => {
-                        let _ = db::mark_job(
-                            &core.db_path,
-                            &job_id,
-                            &asset.id,
-                            "indexed",
-                            None,
-                        );
+                        let _ = db::mark_visual_job(&core.db_path, &job_id, "indexed", None);
                         emit_completed(&app, &asset);
                     }
-                    Err(error) => fail(
+                    Err(error) => fail_visual(
                         &app,
                         &core,
                         &job_id,
@@ -250,17 +277,16 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
                 ai.as_deref(),
                 &core.thumbnail_dir,
                 &asset.id,
+                false,
             ) {
                 Ok(ProcessOutcome::Chunks(chunks)) => {
                     match db::save_chunks(&core.db_path, &job_id, &asset.id, &chunks) {
                         Ok(()) => {
-                            // Full index: also produce visual artifacts for images.
-                            if let Err(error) = run_visual_pass(&core, &asset, "index") {
-                                eprintln!("Visual pass failed for {}: {error}", asset.filename);
-                            }
-                            // Generic metadata + structured searchable summary.
-                            if let Err(error) = run_text_enrichment(&app, &core, &asset) {
-                                eprintln!("Metadata pass failed for {}: {error}", asset.filename);
+                            if let Err(error) = queue_derived_stages(&core, &asset) {
+                                eprintln!(
+                                    "Could not queue derived stages for {}: {error}",
+                                    asset.filename
+                                );
                             }
                             emit_completed(&app, &asset);
                         }
@@ -282,12 +308,9 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
                         // then attach the image embedding + summary.
                         match db::save_chunks(&core.db_path, &job_id, &asset.id, &[]) {
                             Ok(()) => {
-                                if let Err(error) = run_visual_pass(&core, &asset, "index") {
-                                    eprintln!("Visual pass failed for {}: {error}", asset.filename);
-                                }
-                                if let Err(error) = run_text_enrichment(&app, &core, &asset) {
+                                if let Err(error) = queue_derived_stages(&core, &asset) {
                                     eprintln!(
-                                        "Metadata pass failed for {}: {error}",
+                                        "Could not queue derived stages for {}: {error}",
                                         asset.filename
                                     );
                                 }
@@ -347,6 +370,199 @@ pub fn start_worker(app: AppHandle, core: Arc<AppCore>) {
     });
 }
 
+/// The source `index` job owns file decoding/OCR and FTS insertion. Every
+/// output derived from that source is then scheduled independently, so a model
+/// change or failed visual pass never requires re-running OCR.
+fn queue_derived_stages(core: &AppCore, asset: &crate::types::AssetRecord) -> Result<()> {
+    let selection = crate::ai::selection(&core.db_path)?;
+    db::queue_extraction_stage(
+        &core.db_path,
+        &asset.id,
+        "analysis",
+        "recall-deterministic-metadata",
+        crate::metadata::METADATA_EXTRACTOR_VERSION,
+    )?;
+    if core.ai.read().is_some() {
+        db::queue_extraction_stage(
+            &core.db_path,
+            &asset.id,
+            "text_embedding",
+            &selection.embedding_model_id,
+            crate::ai::CHUNKING_VERSION,
+        )?;
+    }
+    if is_image_extension(&asset.extension)
+        && core.visual.read().is_some()
+        && selection.visual_enabled()
+    {
+        db::queue_extraction_stage(
+            &core.db_path,
+            &asset.id,
+            "visual",
+            &selection.visual_model_id,
+            crate::ai::VISUAL_MODEL_VERSION,
+        )?;
+    }
+    if is_image_extension(&asset.extension)
+        && core.visual_tagger.read().is_some()
+        && selection.visual_enabled()
+    {
+        db::queue_extraction_stage(
+            &core.db_path,
+            &asset.id,
+            "visual_tagging",
+            crate::ai::VISUAL_TAGGER_GENERAL,
+            crate::ai::VISUAL_TAGGER_VERSION,
+        )?;
+    }
+    Ok(())
+}
+
+fn process_extraction_stage(
+    app: &AppHandle,
+    core: &AppCore,
+    job_id: &str,
+    stage: &str,
+    asset: &crate::types::AssetRecord,
+) {
+    let _ = app.emit(
+        "indexing://file-started",
+        IndexingEvent {
+            folder_id: Some(asset.folder_id.clone()),
+            asset_id: Some(asset.id.clone()),
+            filename: Some(asset.filename.clone()),
+            completed: None,
+            total: None,
+            message: Some(format!("Running {stage} stage")),
+        },
+    );
+    let result = match stage {
+        "text_embedding" => run_text_embedding_stage(core, asset),
+        "visual" => run_visual_pass(core, asset, "index"),
+        "visual_tagging" => run_visual_tagging_stage(core, asset),
+        "analysis" => run_text_enrichment(app, core, asset, job_id),
+        unknown => Err(format!("Unknown extraction stage: {unknown}").into()),
+    }
+    .and_then(|()| {
+        // Analysis writes richer provenance atomically with classifications and
+        // entities. Other stages get one completion record here.
+        if stage == "analysis" {
+            Ok(())
+        } else {
+            db::record_stage_output_provenance(&core.db_path, &asset.id, job_id)
+        }
+    });
+    match result {
+        Ok(()) => {
+            let _ = db::mark_extraction_stage_job(&core.db_path, job_id, "indexed", None);
+            emit_completed(app, asset);
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let retrying = db::retry_or_fail_extraction_stage_job(&core.db_path, job_id, &message)
+                .unwrap_or(false);
+            let _ = app.emit(
+                "indexing://file-failed",
+                IndexingEvent {
+                    folder_id: Some(asset.folder_id.clone()),
+                    asset_id: Some(asset.id.clone()),
+                    filename: Some(asset.filename.clone()),
+                    completed: None,
+                    total: None,
+                    message: Some(if retrying {
+                        format!("{stage} retry scheduled: {message}")
+                    } else {
+                        format!("{stage} failed: {message}")
+                    }),
+                },
+            );
+        }
+    }
+}
+
+fn run_text_embedding_stage(core: &AppCore, asset: &crate::types::AssetRecord) -> Result<()> {
+    let chunks = db::chunks_without_embeddings(&core.db_path, &asset.id)?;
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let runtime = core
+        .ai
+        .read()
+        .clone()
+        .ok_or("Local text embedding model required")?;
+    let embeddings =
+        runtime.embed_documents(chunks.iter().map(|(_, text)| text.clone()).collect())?;
+    let values = chunks
+        .into_iter()
+        .zip(embeddings)
+        .map(|((id, _), vector)| (id, vector))
+        .collect::<Vec<_>>();
+    db::save_chunk_embeddings(&core.db_path, &values)
+}
+
+fn run_visual_tagging_stage(core: &AppCore, asset: &crate::types::AssetRecord) -> Result<()> {
+    if !is_image_extension(&asset.extension) {
+        return Ok(());
+    }
+    let tagger = core
+        .visual_tagger
+        .read()
+        .clone()
+        .ok_or("Local visual tagger model required")?;
+    let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
+    let regions = extract::image_regions(&image);
+    let mut tags = Vec::new();
+    for crop in regions {
+        tags.extend(tagger.tag_image(&crop.image, crop.region.region_id)?);
+    }
+    let mut best_by_label = std::collections::HashMap::<String, crate::types::VisualTag>::new();
+    for tag in tags {
+        let key = db::normalize_visual_tag(&tag.label);
+        best_by_label
+            .entry(key)
+            .and_modify(|existing| {
+                if tag.confidence > existing.confidence {
+                    *existing = tag.clone();
+                }
+            })
+            .or_insert(tag);
+    }
+    let mut tags = best_by_label.into_values().collect::<Vec<_>>();
+    tags.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    for (rank, tag) in tags.iter_mut().enumerate() {
+        tag.rank = rank;
+    }
+    db::save_visual_tags(
+        &core.db_path,
+        &asset.id,
+        crate::ai::VISUAL_TAGGER_GENERAL,
+        crate::ai::VISUAL_TAGGER_VERSION,
+        &tags,
+    )?;
+    let tag_text = tags
+        .iter()
+        .filter(|tag| !tag.namespace.ends_with(":rating"))
+        .take(40)
+        .map(|tag| tag.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let embedding = match core.ai.read().clone().as_ref() {
+        Some(runtime) if !tag_text.trim().is_empty() => runtime
+            .embed_documents(vec![tag_text.clone()])?
+            .into_iter()
+            .next(),
+        _ => None,
+    };
+    db::upsert_generated_chunk(
+        &core.db_path,
+        &asset.id,
+        "visual_tags",
+        &tag_text,
+        embedding.as_deref(),
+    )?;
+    Ok(())
+}
+
 fn fail(
     app: &AppHandle,
     core: &AppCore,
@@ -355,7 +571,8 @@ fn fail(
     filename: &str,
     message: String,
 ) {
-    let _ = db::mark_job(&core.db_path, job_id, asset_id, "failed", Some(&message));
+    let retrying =
+        db::retry_or_fail_job(&core.db_path, job_id, asset_id, &message).unwrap_or(false);
     let _ = app.emit(
         "indexing://file-failed",
         IndexingEvent {
@@ -364,13 +581,47 @@ fn fail(
             filename: Some(filename.into()),
             completed: None,
             total: None,
-            message: Some(message),
+            message: Some(if retrying {
+                format!("Retry scheduled: {message}")
+            } else {
+                message
+            }),
+        },
+    );
+}
+
+fn fail_visual(
+    app: &AppHandle,
+    core: &AppCore,
+    job_id: &str,
+    asset_id: &str,
+    filename: &str,
+    message: String,
+) {
+    let retrying =
+        db::retry_or_fail_job(&core.db_path, job_id, asset_id, &message).unwrap_or(false);
+    let _ = app.emit(
+        "indexing://file-failed",
+        IndexingEvent {
+            folder_id: None,
+            asset_id: Some(asset_id.into()),
+            filename: Some(filename.into()),
+            completed: None,
+            total: None,
+            message: Some(if retrying {
+                format!("Retry scheduled: {message}")
+            } else {
+                message
+            }),
         },
     );
 }
 
 fn is_image_extension(extension: &str) -> bool {
-    matches!(extension.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp")
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff"
+    )
 }
 
 fn emit_completed(app: &AppHandle, asset: &crate::types::AssetRecord) {
@@ -405,41 +656,72 @@ fn run_visual_pass(core: &AppCore, asset: &crate::types::AssetRecord, stage: &st
     let model_id = selection.visual_model_id.clone();
     let bank = prompt_bank(core, &runtime, &model_id)?;
 
-    // Reuse the cached image embedding when only re-categorizing.
-    let embedding = if stage == "recategorize" {
-        match db::image_embedding_for(&core.db_path, &asset.id, &model_id)? {
-            Some(existing) => existing,
-            None => {
-                let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
-                let vec = runtime.embed_image(&image)?;
+    // Reuse all cached image-region embeddings when only re-categorizing.
+    // Full visual stages rebuild both vectors and their crop provenance.
+    let embeddings: Vec<(i64, Vec<f32>)> = if stage == "recategorize" {
+        let cached = db::image_embeddings_for_all(&core.db_path, &asset.id, &model_id)?;
+        if cached.is_empty() {
+            let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
+            let regions = extract::image_regions(&image);
+            let mut output = Vec::new();
+            for crop in regions {
+                let vector = runtime.embed_image(&crop.image)?;
                 db::save_image_embedding(
                     &core.db_path,
                     &asset.id,
                     &model_id,
                     crate::ai::VISUAL_MODEL_VERSION,
-                    db::WHOLE_IMAGE_PAGE,
-                    &vec,
+                    crop.region.region_id,
+                    &vector,
                 )?;
-                vec
+                db::save_image_embedding_region(
+                    &core.db_path,
+                    &asset.id,
+                    &model_id,
+                    &crop.region,
+                    crate::ai::VISUAL_MODEL_VERSION,
+                )?;
+                output.push((crop.region.region_id, vector));
             }
+            output
+        } else {
+            cached
         }
     } else {
         let image = extract::decode_oriented_rgb(Path::new(&asset.absolute_path))?;
-        let vec = runtime.embed_image(&image)?;
-        drop(image);
-        db::save_image_embedding(
-            &core.db_path,
-            &asset.id,
-            &model_id,
-            crate::ai::VISUAL_MODEL_VERSION,
-            db::WHOLE_IMAGE_PAGE,
-            &vec,
-        )?;
-        vec
+        let regions = extract::image_regions(&image);
+        db::delete_image_embeddings(&core.db_path, &asset.id, &model_id)?;
+        let mut output = Vec::new();
+        for crop in regions {
+            let embedding = runtime.embed_image(&crop.image)?;
+            db::save_image_embedding(
+                &core.db_path,
+                &asset.id,
+                &model_id,
+                crate::ai::VISUAL_MODEL_VERSION,
+                crop.region.region_id,
+                &embedding,
+            )?;
+            db::save_image_embedding_region(
+                &core.db_path,
+                &asset.id,
+                &model_id,
+                &crop.region,
+                crate::ai::VISUAL_MODEL_VERSION,
+            )?;
+            output.push((crop.region.region_id, embedding));
+        }
+        output
     };
+    let embedding = embeddings
+        .iter()
+        .find(|(id, _)| *id == db::WHOLE_IMAGE_PAGE)
+        .map(|(_, embedding)| embedding.clone())
+        .ok_or_else(|| "Image pipeline did not produce a whole-image embedding".to_string())?;
 
-    // Classify into top visual categories (ranking signal, not a filter).
-    let categories = bank.classify(&embedding);
+    // Classify all regions, retaining the strongest category evidence per
+    // parent asset. Search still returns one deduplicated result.
+    let categories = bank.classify_regions(embeddings.iter().map(|(_, vector)| vector.as_slice()));
     db::save_visual_classifications(&core.db_path, &asset.id, &model_id, &categories)?;
     let top = categories
         .first()
@@ -457,7 +739,12 @@ fn run_visual_pass(core: &AppCore, asset: &crate::types::AssetRecord, stage: &st
 /// Extract generic metadata and build a deterministic structured summary for
 /// an asset (any type), persisting metadata and appending an E5-embedded
 /// summary chunk. Runs only on a full `index`.
-fn run_text_enrichment(_app: &AppHandle, core: &AppCore, asset: &crate::types::AssetRecord) -> Result<()> {
+fn run_text_enrichment(
+    _app: &AppHandle,
+    core: &AppCore,
+    asset: &crate::types::AssetRecord,
+    job_id: &str,
+) -> Result<()> {
     let text = db::asset_text(&core.db_path, &asset.id)?;
     let meta = crate::metadata::extract(&text, &asset.filename);
     db::save_asset_metadata(&core.db_path, &asset.id, &meta)?;
@@ -476,7 +763,19 @@ fn run_text_enrichment(_app: &AppHandle, core: &AppCore, asset: &crate::types::A
         }
     };
 
-    let summary = crate::metadata::structured_summary(&asset.filename, &categories, &meta, &text);
+    let classification = crate::metadata::classify_document(&text, &asset.filename, &categories);
+    let entities = crate::metadata::extract_entities(&text, &meta);
+    db::save_document_analysis(&core.db_path, &asset.id, job_id, &classification, &entities)?;
+
+    let mut summary =
+        crate::metadata::structured_summary(&asset.filename, &categories, &meta, &text);
+    if classification.document_type != "other" {
+        summary.push_str(&format!(
+            " Document type: {}. Evidence: {}.",
+            classification.document_type.replace('_', " "),
+            classification.evidence.join(", ")
+        ));
+    }
     if summary.trim().is_empty() {
         return Ok(());
     }

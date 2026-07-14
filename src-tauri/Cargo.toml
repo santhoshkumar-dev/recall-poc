@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 anyhow = "1"
 arboard = "3"
 chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 mime_guess = "2"
 ocrs = "0.12"
@@ -49,6 +50,7 @@ kamadak-exif = "0.6"
 
 [profile.dev]
 opt-level = 1
+incremental = false
 
 [profile.dev.package."*"]
 opt-level = 2

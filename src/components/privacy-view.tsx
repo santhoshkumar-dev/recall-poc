@@ -6,6 +6,7 @@ import {
   Download,
   HardDrive,
   LockKeyhole,
+  RefreshCw,
   ShieldCheck,
   SlidersHorizontal,
   WifiOff,
@@ -27,6 +28,7 @@ export function PrivacyView({ onRefresh }: { onRefresh: () => Promise<void> }) {
   const [visualModelId, setVisualModelId] = useState("");
   const [ocrMaxSide, setOcrMaxSide] = useState(1280);
   const [saving, setSaving] = useState(false);
+  const [visualReindexing, setVisualReindexing] = useState(false);
   const [error, setError] = useState<string>();
   const [diagnostics, setDiagnostics] = useState<VisualDiagnostics>();
 
@@ -83,6 +85,20 @@ export function PrivacyView({ onRefresh }: { onRefresh: () => Promise<void> }) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const reindexVisualLibrary = async () => {
+    if (!window.confirm("Re-index all image embeddings? OCR and document-text embeddings will not be changed.")) return;
+    setVisualReindexing(true);
+    setError(undefined);
+    try {
+      await recallApi.reindexVisualLibrary();
+      await Promise.all([onRefresh(), loadDiagnostics()]);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setVisualReindexing(false);
     }
   };
 
@@ -237,7 +253,13 @@ export function PrivacyView({ onRefresh }: { onRefresh: () => Promise<void> }) {
         </Button>
       </section>
 
-      <VisualDiagnosticsPanel diagnostics={diagnostics} onRefresh={loadDiagnostics} />
+      <VisualDiagnosticsPanel
+        diagnostics={diagnostics}
+        onRefresh={loadDiagnostics}
+        onReindex={reindexVisualLibrary}
+        reindexing={visualReindexing}
+        reindexDisabled={busy || visualReindexing || processing || (indexing?.pending ?? 0) > 0}
+      />
 
       <section className="panel mt-8 p-6">
         <p className="eyebrow">Answer generation</p>
@@ -267,9 +289,15 @@ export function PrivacyView({ onRefresh }: { onRefresh: () => Promise<void> }) {
 function VisualDiagnosticsPanel({
   diagnostics,
   onRefresh,
+  onReindex,
+  reindexing,
+  reindexDisabled,
 }: {
   diagnostics?: VisualDiagnostics;
   onRefresh: () => Promise<void>;
+  onReindex: () => Promise<void>;
+  reindexing: boolean;
+  reindexDisabled: boolean;
 }) {
   if (!diagnostics) return null;
   const d = diagnostics;
@@ -324,7 +352,10 @@ function VisualDiagnosticsPanel({
             value={`${d.imagesWithEmbeddings} (${coverage}%)`}
             tone={coverage >= 99 ? "good" : coverage > 0 ? "warn" : "bad"}
           />
+          <Row label="Adaptive regions" value={`${d.regionEmbeddings} across ${d.imagesWithRegions} images`} />
           <Row label="Images classified" value={String(d.imagesClassified)} />
+          <Row label="Images tagged" value={String(d.imagesTagged)} />
+          <Row label="Visual tags stored" value={String(d.visualTags)} />
           <Row label="Pending jobs" value={String(d.pendingJobs)} tone={d.pendingJobs > 0 ? "warn" : "good"} />
           <Row label="Failed jobs" value={String(d.failedJobs)} tone={d.failedJobs > 0 ? "bad" : "good"} />
         </div>
@@ -341,6 +372,20 @@ function VisualDiagnosticsPanel({
           not appear in visual results until indexing finishes ({d.pendingJobs} job(s) pending).
         </p>
       )}
+      <div className="mt-5 flex flex-wrap items-center gap-3 border-t border-black/10 pt-5">
+        <Button
+          variant="secondary"
+          disabled={!loadOk || reindexDisabled}
+          onClick={() => void onReindex()}
+        >
+          <RefreshCw size={15} className={reindexing ? "animate-spin" : undefined} />
+          {reindexing ? "Queuing visual re-index..." : "Re-index visual library"}
+        </Button>
+        <p className="max-w-2xl text-xs leading-5 text-black/45">
+          Rebuilds MobileCLIP image embeddings, prompt-bank diagnostics, and model-produced visual tags.
+          Normal query text changes reuse existing image evidence and do not require this action.
+        </p>
+      </div>
     </section>
   );
 }

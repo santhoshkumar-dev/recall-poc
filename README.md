@@ -4,6 +4,14 @@ Recall is a Windows desktop proof of concept for private local file search. User
 
 There is no account, hosted backend, telemetry service, remote inference endpoint, or production Node.js server.
 
+## License and hackathon source
+
+Recall is released as **AGPL-3.0-or-later** for this hackathon submission. See
+[`LICENSE`](LICENSE), [`NOTICE`](NOTICE), and
+[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES). The complete source required to
+build the demo is this repository; the Windows development and installer steps
+below are the corresponding build instructions.
+
 ## POC capabilities
 
 - Tauri 2 native Windows shell with a Next.js static-export frontend.
@@ -16,7 +24,8 @@ There is no account, hosted backend, telemetry service, remote inference endpoin
 - Explicit model setup followed by offline operation.
 - Pause/resume, rescan, missing-file reconciliation, isolated failures, and persisted recovery.
 
-Live folder watching, scanned-PDF OCR, generative answers, authentication, cloud sync, and Office formats are intentionally out of scope for this milestone.
+Live folder watching, scanned-PDF OCR (PDF text layers are supported), generative answers,
+authentication, cloud sync, and Office formats are intentionally out of scope for this milestone.
 
 ## Multimodal retrieval (optional visual search)
 
@@ -35,6 +44,21 @@ search, kept in a vector space completely separate from the E5 text space.
   scores each image into its top visual categories; used as ranking boosts, never as filters.
 - **Generic metadata + summaries.** Deterministic (no-LLM) extraction of dates, amounts,
   URLs, emails, phones and identifiers, plus a structured searchable summary embedded with E5.
+- **Ticket-aware document evidence.** OCR/PDF text and filenames are classified locally as
+  train/flight tickets, hotel bookings, invoices, or receipts; PNRs, train/flight numbers,
+  booking/invoice IDs, dates, routes, and amounts are stored as typed entities. Document and
+  entity matches are visible in the retrieval inspector and prevent a visual-only ticket label
+  from ranking as strong evidence.
+- **Tall screenshot coverage.** Whole-image vectors are retained for photo search; tall images
+  also receive adaptive vertical regions, with all region hits deduplicated to the parent
+  asset in results.
+- **Adaptive image quality pipeline.** Images are EXIF-oriented and alpha-composited before OCR
+  and visual encoding. Large, panoramic, and tall images receive deterministic aspect or pixel-grid
+  regions; every region is embedded, classified, stored with source geometry, and aggregated back
+  to one parent result. A visual pipeline update automatically refreshes only stale image vectors.
+- **Stable identity + provenance.** SHA-256 content identities survive renames/moves within a
+  watched folder. Reduced per-stage provenance records the extractor/version, source region,
+  confidence, and queue job for deterministic document analysis.
 - **Explainable results.** Each result shows *why* it matched; a per-query retrieval inspector
   (toggle in Search) shows per-channel ranks, scores, intents and latency.
 - **Scoped reindexing.** Enabling/switching the visual model regenerates image embeddings and
@@ -82,6 +106,9 @@ If models are missing, text documents can still be indexed for keyword search. I
 ## Sample corpus
 
 Choose the [`sample-data`](sample-data) directory during onboarding. It contains safe synthetic fixtures for every supported format plus [`expected-queries.json`](sample-data/expected-queries.json) with repeatable queries and expected sources/pages.
+
+[`hackathon-evaluation.json`](sample-data/hackathon-evaluation.json) defines the required local
+regression queries, evidence expectations, and measurements to report for the hackathon demo.
 
 Regenerate binary fixtures with:
 

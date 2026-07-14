@@ -89,17 +89,28 @@ export type MatchReason =
   | "exact_text"
   | "semantic_text"
   | "visual_similarity"
+  | "visual_tag"
   | "visual_category"
   | "date"
   | "amount"
   | "filename"
   | "folder"
   | "file_type"
-  | "metadata";
+  | "metadata"
+  | "document_type"
+  | "entity";
 
 export interface VisualCategory {
   label: string;
   score: number;
+}
+
+export interface VisualTag {
+  regionId: number;
+  namespace: string;
+  label: string;
+  confidence: number;
+  rank: number;
 }
 
 export interface SearchResult {
@@ -113,9 +124,15 @@ export interface SearchResult {
   keywordScore: number;
   combinedScore: number;
   visualScore: number;
+  visualZScore: number;
+  visualRegionId?: number;
   categoryScore: number;
+  categoryPositiveScore: number;
+  categoryNegativeScore: number;
   matchReasons: MatchReason[];
   topCategories: VisualCategory[];
+  topVisualTags: VisualTag[];
+  confidence: "strong" | "moderate";
 }
 
 export interface ChannelResult {
@@ -136,6 +153,8 @@ export interface ChannelDiagnostics {
 
 export interface SearchDebugReport {
   query: string;
+  visualQuery: boolean;
+  visualPrompts: string[];
   intents: QueryIntent[];
   expandedCategories: string[];
   appliedFilters: string[];
@@ -155,7 +174,11 @@ export interface VisualDiagnostics {
   imageAssets: number;
   imagesIndexed: number;
   imagesWithEmbeddings: number;
+  regionEmbeddings: number;
+  imagesWithRegions: number;
   imagesClassified: number;
+  imagesTagged: number;
+  visualTags: number;
   pendingJobs: number;
   failedJobs: number;
 }

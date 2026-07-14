@@ -65,7 +65,11 @@ pub struct VisualDiagnostics {
     pub image_assets: i64,
     pub images_indexed: i64,
     pub images_with_embeddings: i64,
+    pub region_embeddings: i64,
+    pub images_with_regions: i64,
     pub images_classified: i64,
+    pub images_tagged: i64,
+    pub visual_tags: i64,
     pub pending_jobs: i64,
     pub failed_jobs: i64,
 }
@@ -126,7 +130,6 @@ pub struct AssetRecord {
 #[derive(Debug, Clone)]
 pub struct AssetBrief {
     pub id: String,
-    #[allow(dead_code)] // carried for folder-scoped features; not yet read in fusion.
     pub folder_id: String,
     pub filename: String,
     pub extension: Option<String>,
@@ -156,11 +159,25 @@ pub struct SearchResult {
     #[serde(default)]
     pub visual_score: f32,
     #[serde(default)]
+    pub visual_z_score: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_region_id: Option<i64>,
+    #[serde(default)]
     pub category_score: f32,
+    #[serde(default)]
+    pub category_positive_score: f32,
+    #[serde(default)]
+    pub category_negative_score: f32,
     #[serde(default)]
     pub match_reasons: Vec<MatchReason>,
     #[serde(default)]
     pub top_categories: Vec<VisualCategory>,
+    #[serde(default)]
+    pub top_visual_tags: Vec<VisualTag>,
+    /// Evidence-based confidence label ("strong" | "moderate"). `combined_score`
+    /// is retained only as an internal ordering score, never shown as a %.
+    #[serde(default)]
+    pub confidence: String,
 }
 
 impl SearchResult {
@@ -188,9 +205,15 @@ impl SearchResult {
             keyword_score,
             combined_score,
             visual_score: 0.0,
+            visual_z_score: 0.0,
+            visual_region_id: None,
             category_score: 0.0,
+            category_positive_score: 0.0,
+            category_negative_score: 0.0,
             match_reasons: Vec::new(),
             top_categories: Vec::new(),
+            top_visual_tags: Vec::new(),
+            confidence: String::new(),
         }
     }
 }
@@ -218,6 +241,7 @@ pub enum MatchReason {
     ExactText,
     SemanticText,
     VisualSimilarity,
+    VisualTag,
     VisualCategory,
     Date,
     Amount,
@@ -225,6 +249,8 @@ pub enum MatchReason {
     Folder,
     FileType,
     Metadata,
+    DocumentType,
+    Entity,
 }
 
 /// One retrieval channel's ranking of a single asset (developer inspector).
@@ -254,6 +280,8 @@ pub struct ChannelDiagnostics {
 #[serde(rename_all = "camelCase")]
 pub struct SearchDebugReport {
     pub query: String,
+    pub visual_query: bool,
+    pub visual_prompts: Vec<String>,
     pub intents: Vec<QueryIntent>,
     pub expanded_categories: Vec<String>,
     pub applied_filters: Vec<String>,
@@ -302,12 +330,42 @@ pub struct ExtractedMetadata {
     pub has_qr_code: Option<bool>,
 }
 
+/// Deterministic document evidence used by the ticket/receipt retrieval path.
+/// Values are intentionally small and stable because they are persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentClassification {
+    pub document_type: String,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractedEntity {
+    pub entity_type: String,
+    pub raw_value: String,
+    pub normalized_value: String,
+    pub confidence: f32,
+}
+
 /// One visual category score for an asset.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VisualCategory {
     pub label: String,
     pub score: f32,
+}
+
+/// One model-produced visual tag for an image or region.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualTag {
+    pub region_id: i64,
+    pub namespace: String,
+    pub label: String,
+    pub confidence: f32,
+    pub rank: usize,
 }
 
 #[derive(Debug, Clone)]

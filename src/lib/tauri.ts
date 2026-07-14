@@ -50,6 +50,7 @@ export const recallApi = {
   searchDebug: (query: string, filters: SearchFilters) =>
     desktopInvoke<SearchDebugReport>("search_files_debug", { query, filters }),
   visualDiagnostics: () => desktopInvoke<VisualDiagnostics>("get_visual_diagnostics"),
+  reindexVisualLibrary: () => desktopInvoke<IndexingStatus>("reindex_visual_library"),
   open: (assetId: string) => desktopInvoke<void>("open_source_file", { assetId }),
   reveal: (assetId: string) => desktopInvoke<void>("reveal_source_file", { assetId }),
   copyPath: (assetId: string) => desktopInvoke<void>("copy_source_path", { assetId }),

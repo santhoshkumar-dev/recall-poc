@@ -136,17 +136,48 @@ pub async fn update_model_selection(
                 }
             }
             *core.visual_prompts.write() = None;
+            match ai::load_visual_tagger_for_selection(&core.model_dir, &selected) {
+                Ok(Some(runtime)) => {
+                    eprintln!("[visual-tags] runtime loaded");
+                    *core.visual_tagger.write() = Some(runtime);
+                }
+                Ok(None) => {
+                    *core.visual_tagger.write() = None;
+                }
+                Err(error) => {
+                    eprintln!("[visual-tags] runtime FAILED to load: {error}");
+                    *core.visual_tagger.write() = None;
+                }
+            }
 
-            if let Err(error) =
-                db::queue_model_reindex(&core.db_path, ocr_changed, embedding_changed)
-            {
+            if let Err(error) = db::queue_model_reindex(
+                &core.db_path,
+                ocr_changed,
+                embedding_changed,
+                &selected.embedding_model_id,
+                crate::ai::CHUNKING_VERSION,
+            ) {
                 core.paused.store(was_paused, Ordering::SeqCst);
                 return Err(error);
             }
             // If only the visual model changed, re-embed image assets only
             // (never text/E5). A full embedding reindex already covers images.
             if visual_changed && !embedding_changed && selected.visual_enabled() {
-                if let Err(error) = db::queue_visual_reindex(&core.db_path, "visual") {
+                if let Err(error) = db::queue_visual_stage_reindex(
+                    &core.db_path,
+                    &selected.visual_model_id,
+                    crate::ai::VISUAL_MODEL_VERSION,
+                ) {
+                    core.paused.store(was_paused, Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
+            if visual_changed && selected.visual_enabled() && core.visual_tagger.read().is_some() {
+                if let Err(error) = db::queue_visual_tagging_stage_reindex(
+                    &core.db_path,
+                    crate::ai::VISUAL_TAGGER_GENERAL,
+                    crate::ai::VISUAL_TAGGER_VERSION,
+                ) {
                     core.paused.store(was_paused, Ordering::SeqCst);
                     return Err(error);
                 }
@@ -279,7 +310,9 @@ pub fn retry_failed_job(
     job_id: String,
 ) -> Result<()> {
     let connection = db::connect(&core.db_path)?;
-    let changed = connection.execute("UPDATE indexing_jobs SET state='pending',error_message=NULL,updated_at=?2 WHERE id=?1 AND state='failed'", rusqlite::params![job_id,chrono::Utc::now().to_rfc3339()])?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let changed = connection.execute("UPDATE indexing_jobs SET state='pending',error_message=NULL,updated_at=?2 WHERE id=?1 AND state='failed'", rusqlite::params![job_id, now])?
+        + connection.execute("UPDATE extraction_stage_jobs SET state='pending',error_message=NULL,updated_at=?2 WHERE id=?1 AND state='failed'", rusqlite::params![job_id, chrono::Utc::now().to_rfc3339()])?;
     if changed == 0 {
         return Err("Failed job was not found".into());
     }
@@ -325,8 +358,16 @@ pub fn get_visual_diagnostics(
     let selection = ai::selection(&core.db_path)?;
     let model_id = selection.visual_model_id.clone();
     let runtime = core.visual.read().clone();
-    let (image_assets, images_indexed, images_with_embeddings, images_classified) =
-        db::visual_counts(&core.db_path, &model_id)?;
+    let (
+        image_assets,
+        images_indexed,
+        images_with_embeddings,
+        region_embeddings,
+        images_with_regions,
+        images_classified,
+    ) = db::visual_counts(&core.db_path, &model_id)?;
+    let (images_tagged, visual_tags) =
+        db::visual_tag_counts(&core.db_path, crate::ai::VISUAL_TAGGER_GENERAL)?;
     let status = db::indexing_status(&core.db_path)?;
     Ok(crate::types::VisualDiagnostics {
         visual_enabled: selection.visual_enabled(),
@@ -339,10 +380,52 @@ pub fn get_visual_diagnostics(
         image_assets,
         images_indexed,
         images_with_embeddings,
+        region_embeddings,
+        images_with_regions,
         images_classified,
+        images_tagged,
+        visual_tags,
         pending_jobs: status.pending,
         failed_jobs: status.failed,
     })
+}
+
+#[tauri::command]
+pub fn reindex_visual_library(
+    app: AppHandle,
+    core: State<'_, Arc<AppCore>>,
+) -> Result<IndexingStatus> {
+    let core = core.inner().clone();
+    let selection = ai::selection(&core.db_path)?;
+    if !selection.visual_enabled() {
+        return Err("Enable and install a visual-search model before re-indexing".into());
+    }
+    if core.visual.read().is_none() {
+        return Err("The visual-search runtime is not loaded".into());
+    }
+    let status = db::indexing_status(&core.db_path)?;
+    if status.processing > 0 || status.pending > 0 {
+        return Err(
+            "Wait for the current indexing queue to finish before re-indexing visuals".into(),
+        );
+    }
+
+    db::queue_visual_stage_reindex(
+        &core.db_path,
+        &selection.visual_model_id,
+        crate::ai::VISUAL_MODEL_VERSION,
+    )?;
+    if core.visual_tagger.read().is_some() {
+        db::queue_visual_tagging_stage_reindex(
+            &core.db_path,
+            crate::ai::VISUAL_TAGGER_GENERAL,
+            crate::ai::VISUAL_TAGGER_VERSION,
+        )?;
+    }
+    if !core.paused.load(Ordering::SeqCst) {
+        indexer::start_worker(app, core.clone());
+    }
+    db::indexing_status(&core.db_path)
 }
 
 #[tauri::command(rename_all = "camelCase")]

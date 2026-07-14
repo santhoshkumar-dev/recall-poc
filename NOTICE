@@ -1,0 +1,16 @@
+Recall is a local-first Tauri application for the Recall hackathon.
+
+This hackathon submission is licensed under AGPL-3.0-or-later.
+
+The design and selected implementation approaches for content identity,
+extraction provenance, and resilient extraction stages were adapted from
+Panoptikon (https://github.com/rea-sv/panoptikon), licensed
+AGPL-3.0-or-later.  The source baseline reviewed for this work is pinned in
+THIRD_PARTY_NOTICES.  Recall retains its own Tauri UI, local Rust inference
+stack, SQLite data model, and queue worker; Panoptikon's HTTP server, PQL API,
+desktop-server supervisor, Python packaging, browser UI, and Python workers
+are not included.
+
+Where a future change copies a Panoptikon source file, its original copyright
+and license header must remain in that file and this notice must be updated
+with the copied path and modification summary.

@@ -23,10 +23,12 @@ pub(crate) fn load_candidates(
     connection: &rusqlite::Connection,
     filters: &SearchFilters,
 ) -> Result<Vec<Candidate>> {
-    let mut statement = connection.prepare(r#"
+    let mut statement = connection.prepare(
+        r#"
       SELECT c.id,c.asset_id,a.folder_id,a.extension,c.page_number,c.text,c.embedding
       FROM chunks c JOIN assets a ON a.id=c.asset_id WHERE a.available=1 AND a.status='indexed'
-    "#)?;
+    "#,
+    )?;
     let rows = statement.query_map([], |r| {
         Ok(Candidate {
             chunk_id: r.get(0)?,
@@ -47,16 +49,16 @@ pub(crate) fn load_candidates(
         .collect())
 }
 
-/// Raw (non-negative) BM25 keyword scores per chunk id for a query.
+/// Raw (non-negative) BM25 keyword scores per chunk id for an FTS MATCH string.
+/// An empty match string yields no results.
 pub(crate) fn fts_scores(
     connection: &rusqlite::Connection,
-    query: &str,
+    match_expr: &str,
 ) -> Result<HashMap<String, f32>> {
     let mut keyword_raw: HashMap<String, f32> = HashMap::new();
-    let fts_query = fts_query(query);
-    if !fts_query.is_empty() {
+    if !match_expr.is_empty() {
         let mut fts = connection.prepare("SELECT chunk_id, -bm25(chunks_fts) FROM chunks_fts WHERE chunks_fts MATCH ?1 LIMIT 250")?;
-        let matches = fts.query_map([fts_query], |r| {
+        let matches = fts.query_map([match_expr], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)? as f32))
         })?;
         for row in matches {
@@ -65,6 +67,32 @@ pub(crate) fn fts_scores(
         }
     }
     Ok(keyword_raw)
+}
+
+/// Build a precise FTS5 MATCH expression: a CONJUNCTION of the required terms
+/// (all must appear), optionally OR'd with exact phrases for adjacency ranking.
+///
+/// Uses prefix terms so plurals match (`ticket*` → ticket/tickets), but because
+/// every term is required, a single unrelated prefix hit cannot qualify: query
+/// "train ticket" needs both `train*` AND `ticket*`, so a "training" screenshot
+/// with no ticket word never matches. This replaces the old permissive prefix-OR.
+pub(crate) fn fts_conjunction(required_terms: &[String], phrases: &[String]) -> String {
+    if required_terms.is_empty() {
+        return String::new();
+    }
+    let conjunction = required_terms
+        .iter()
+        .map(|t| format!("\"{}\"*", t.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut expr = format!("({conjunction})");
+    for phrase in phrases {
+        let cleaned = phrase.replace('"', "");
+        if cleaned.split_whitespace().count() >= 2 {
+            expr.push_str(&format!(" OR \"{cleaned}\""));
+        }
+    }
+    expr
 }
 
 pub(crate) fn matches_filters(candidate: &Candidate, filters: &SearchFilters) -> bool {
@@ -84,15 +112,6 @@ pub(crate) fn matches_filters(candidate: &Candidate, filters: &SearchFilters) ->
                     .any(|allowed| allowed.eq_ignore_ascii_case(ext))
             })
             .unwrap_or(false)
-}
-
-pub(crate) fn fts_query(query: &str) -> String {
-    query
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|part| part.len() > 1)
-        .map(|part| format!("\"{}\"*", part.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(" OR ")
 }
 
 pub fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
@@ -138,7 +157,32 @@ mod tests {
         assert!((cosine_similarity(&[1.0, 2.0], &[1.0, 2.0]) - 1.0).abs() < 0.0001);
     }
     #[test]
-    fn fts_input_is_quoted() {
-        assert_eq!(fts_query("train ticket!"), "\"train\"* OR \"ticket\"*");
+    fn fts_conjunction_requires_all_terms() {
+        let expr = fts_conjunction(&["train".into(), "ticket".into()], &["train ticket".into()]);
+        assert_eq!(expr, "(\"train\"* AND \"ticket\"*) OR \"train ticket\"");
+    }
+
+    #[test]
+    fn fts_conjunction_empty_without_terms() {
+        assert_eq!(fts_conjunction(&[], &[]), "");
+    }
+
+    #[test]
+    fn train_ticket_fts_rejects_training_only_distractor() -> Result<()> {
+        let connection = rusqlite::Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE VIRTUAL TABLE chunks_fts USING fts5(chunk_id UNINDEXED, text, tokenize='unicode61');
+             INSERT INTO chunks_fts(chunk_id, text) VALUES
+               ('distractor', 'Adobe Photoshop training lesson with image editing tools'),
+               ('ticket', 'Indian Railways train ticket booking confirmation');",
+        )?;
+
+        let terms = vec!["train".to_string(), "ticket".to_string()];
+        let phrases = vec!["train ticket".to_string()];
+        let scores = fts_scores(&connection, &fts_conjunction(&terms, &phrases))?;
+
+        assert!(scores.contains_key("ticket"));
+        assert!(!scores.contains_key("distractor"));
+        Ok(())
     }
 }

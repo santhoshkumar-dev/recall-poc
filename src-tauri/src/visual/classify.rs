@@ -81,11 +81,9 @@ impl PromptBank {
         })
     }
 
-    /// Score a (L2-normalized) image embedding against every category, returning
-    /// the top [`TOP_CATEGORIES`] best-first.
-    pub fn classify(&self, image_embedding: &[f32]) -> Vec<VisualCategory> {
+    /// Per-label score (max prompt cosine) for a normalized image embedding.
+    pub fn label_scores(&self, image_embedding: &[f32]) -> Vec<VisualCategory> {
         use std::collections::HashMap;
-        // Collect per-label prompt scores (cosine == dot for normalized vectors).
         let mut per_label: HashMap<&str, Vec<f32>> = HashMap::new();
         for prompt in &self.prompts {
             let score = dot(image_embedding, &prompt.vector);
@@ -109,8 +107,69 @@ impl PromptBank {
             })
             .collect();
         scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+        scored
+    }
+
+    /// Top [`TOP_CATEGORIES`] categories (for persisted classification).
+    pub fn classify(&self, image_embedding: &[f32]) -> Vec<VisualCategory> {
+        let mut scored = self.label_scores(image_embedding);
         scored.truncate(TOP_CATEGORIES);
         scored
+    }
+
+    /// Aggregate classifications across whole images and their regions. A
+    /// localized document cue (for example a ticket panel in a tall screenshot)
+    /// should be retained without making the parent result appear multiple times.
+    pub fn classify_regions<'a>(
+        &self,
+        embeddings: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Vec<VisualCategory> {
+        let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        for embedding in embeddings {
+            for category in self.label_scores(embedding) {
+                best.entry(category.label)
+                    .and_modify(|score| *score = score.max(category.score))
+                    .or_insert(category.score);
+            }
+        }
+        let mut categories = best
+            .into_iter()
+            .map(|(label, score)| VisualCategory { label, score })
+            .collect::<Vec<_>>();
+        categories.sort_by(|a, b| b.score.total_cmp(&a.score));
+        categories.truncate(TOP_CATEGORIES);
+        categories
+    }
+
+    /// Discriminative margin for `primary` label: its prompt similarity minus
+    /// the best competing category's similarity. Positive when the image looks
+    /// more like `primary` than anything else; negative for unrelated images.
+    /// Returns (positive_score, best_other_score, margin).
+    pub fn category_margin(&self, image_embedding: &[f32], primary: &str) -> (f32, f32, f32) {
+        self.category_set_margin(image_embedding, &[primary.to_string()])
+    }
+
+    /// Margin between the best requested category and the best category not in
+    /// the requested set. Supports both specific and broad category plans.
+    pub fn category_set_margin(
+        &self,
+        image_embedding: &[f32],
+        requested: &[String],
+    ) -> (f32, f32, f32) {
+        let scores = self.label_scores(image_embedding);
+        let pos = scores
+            .iter()
+            .filter(|c| requested.iter().any(|label| label == &c.label))
+            .map(|c| c.score)
+            .fold(f32::MIN, f32::max)
+            .max(0.0);
+        let neg = scores
+            .iter()
+            .filter(|c| !requested.iter().any(|label| label == &c.label))
+            .map(|c| c.score)
+            .fold(f32::MIN, f32::max)
+            .max(0.0);
+        (pos, neg, pos - neg)
     }
 }
 

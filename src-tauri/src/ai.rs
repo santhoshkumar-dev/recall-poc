@@ -78,6 +78,12 @@ const MOBILECLIP_TEXT_SHA256: &str =
     "df590d47744f2ee9f3ccb67c4414d17419568c05bca0c4d166f2faeedf8b92f3";
 const MOBILECLIP_TOKENIZER_URL: &str =
     "https://huggingface.co/plhery/mobileclip2-onnx/resolve/main/tokenizer.json";
+const WD_SWINV2_TAGGER_MODEL_URL: &str =
+    "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/model.onnx";
+const WD_SWINV2_TAGGER_MODEL_SHA256: &str =
+    "e61cc3e30576e50c745bd2224a2d03bec65637a84328301da8717d291d9eb96a";
+const WD_SWINV2_TAGGER_LABELS_URL: &str =
+    "https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3/resolve/main/selected_tags.csv";
 
 pub const OCRS_NATIVE: &str = "ocrs-native";
 pub const PPOCRV6_TINY: &str = "ppocrv6-tiny";
@@ -88,10 +94,13 @@ pub const EMBEDDING_GEMMA_Q8: &str = "embedding-gemma-q8";
 /// Visual-search model ids. `disabled` = OCR + text search only (no download).
 pub const VISUAL_DISABLED: &str = "disabled";
 pub const MOBILECLIP2_S0: &str = "mobileclip2-s0";
+pub const VISUAL_TAGGER_GENERAL: &str = "visual-tags/general-v1";
 /// Bump when the visual encoder itself changes (regenerate image embeddings).
-pub const VISUAL_MODEL_VERSION: &str = "1";
+pub const VISUAL_MODEL_VERSION: &str = "2";
+/// Bump when visual tagging preprocessing / thresholds change.
+pub const VISUAL_TAGGER_VERSION: &str = "1";
 /// Bump when chunking (regional chunks / summary) changes materially.
-pub const CHUNKING_VERSION: &str = "2";
+pub const CHUNKING_VERSION: &str = "3";
 pub const DEFAULT_OCR_MODEL: &str = PPOCRV6_TINY;
 pub const DEFAULT_EMBEDDING_MODEL: &str = E5_SMALL;
 pub const DEFAULT_VISUAL_MODEL: &str = VISUAL_DISABLED;
@@ -440,6 +449,7 @@ pub fn install_selection(
     install_embedding(app, model_dir, &selected.embedding_model_id)?;
     if selected.visual_enabled() {
         install_visual(app, model_dir, &selected.visual_model_id)?;
+        install_visual_tagger(app, model_dir)?;
     }
     let runtime = Arc::new(AiRuntime::load_for_selection(model_dir, selected)?);
     emit(app, 94, "downloading", "Verifying offline model runtime")?;
@@ -655,13 +665,29 @@ pub fn is_visual_installed(model_dir: &Path, model_id: &str) -> bool {
         .all(|f| dir.join(f).is_file())
 }
 
+pub fn visual_tagger_directory(model_dir: &Path) -> PathBuf {
+    model_dir.join("visual-tags").join("general-v1")
+}
+
+pub fn is_visual_tagger_installed(model_dir: &Path) -> bool {
+    let dir = visual_tagger_directory(model_dir);
+    ["model.onnx", "selected_tags.csv"]
+        .iter()
+        .all(|file| dir.join(file).is_file())
+}
+
 fn install_visual(app: &AppHandle, model_dir: &Path, model_id: &str) -> Result<()> {
     if model_id != MOBILECLIP2_S0 {
         return Ok(());
     }
     let directory = visual_directory(model_dir, model_id);
     fs::create_dir_all(&directory)?;
-    emit(app, 90, "downloading", "Preparing MobileCLIP2-S0 visual model")?;
+    emit(
+        app,
+        90,
+        "downloading",
+        "Preparing MobileCLIP2-S0 visual model",
+    )?;
     download_verified(
         app,
         MOBILECLIP_VISION_URL,
@@ -681,8 +707,36 @@ fn install_visual(app: &AppHandle, model_dir: &Path, model_id: &str) -> Result<(
     // Only tokenizer.json is read at runtime; config.json (98 B) /
     // preprocessor_config.json values are hardcoded in the encoder, and their
     // tiny size trips download_file's small-file guard, so we don't fetch them.
-    download_file(app, MOBILECLIP_TOKENIZER_URL, &directory.join("tokenizer.json"), 97, 99)?;
+    download_file(
+        app,
+        MOBILECLIP_TOKENIZER_URL,
+        &directory.join("tokenizer.json"),
+        97,
+        99,
+    )?;
     emit(app, 99, "downloading", "MobileCLIP2-S0 files verified")
+}
+
+fn install_visual_tagger(app: &AppHandle, model_dir: &Path) -> Result<()> {
+    let directory = visual_tagger_directory(model_dir);
+    fs::create_dir_all(&directory)?;
+    emit(app, 99, "downloading", "Preparing general visual tagger")?;
+    download_verified(
+        app,
+        WD_SWINV2_TAGGER_MODEL_URL,
+        &directory.join("model.onnx"),
+        WD_SWINV2_TAGGER_MODEL_SHA256,
+        99,
+        99,
+    )?;
+    download_file(
+        app,
+        WD_SWINV2_TAGGER_LABELS_URL,
+        &directory.join("selected_tags.csv"),
+        99,
+        99,
+    )?;
+    emit(app, 99, "downloading", "Visual tagger files verified")
 }
 
 /// Load the visual runtime for a selection, if a visual model is enabled and
@@ -700,6 +754,18 @@ pub fn load_visual_for_selection(
     }
     let dir = visual_directory(model_dir, &selected.visual_model_id);
     Ok(Some(Arc::new(crate::visual::VisualRuntime::load(&dir)?)))
+}
+
+pub fn load_visual_tagger_for_selection(
+    model_dir: &Path,
+    selected: &ModelSelection,
+) -> Result<Option<Arc<crate::visual::VisualTaggerRuntime>>> {
+    if !selected.visual_enabled() || !is_visual_tagger_installed(model_dir) {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(crate::visual::VisualTaggerRuntime::load(
+        &visual_tagger_directory(model_dir),
+    )?)))
 }
 
 fn load_embedding_runtime(model_dir: &Path, model_id: &str) -> Result<TextEmbedding> {
@@ -783,7 +849,9 @@ fn download_verified(
     let actual = sha256_file(&temporary)?;
     if actual != expected_sha256 {
         let _ = fs::remove_file(&temporary);
-        eprintln!("[download] CHECKSUM MISMATCH for {name}: expected {expected_sha256}, got {actual}");
+        eprintln!(
+            "[download] CHECKSUM MISMATCH for {name}: expected {expected_sha256}, got {actual}"
+        );
         return Err(RecallError::Message(format!(
             "Checksum validation failed for {name}"
         )));
@@ -821,7 +889,13 @@ fn download_file(
         return Err("Downloaded model metadata was unexpectedly small".into());
     }
     fs::rename(temporary, destination)?;
-    eprintln!("[download] OK {} ({bytes} bytes)", destination.file_name().unwrap_or_default().to_string_lossy());
+    eprintln!(
+        "[download] OK {} ({bytes} bytes)",
+        destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    );
     Ok(())
 }
 

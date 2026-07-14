@@ -1,0 +1,31 @@
+# Third-party notices
+
+## Panoptikon
+
+Copyright (c) Panoptikon contributors.
+License: GNU Affero General Public License, version 3 or later
+(AGPL-3.0-or-later).
+
+Upstream repository: https://github.com/rea-sv/panoptikon
+Reviewed revision: `de385a36161ad07d50f841baab61c54a7ee066c8`
+
+Recall's hash-based content identity, reduced extraction provenance, and
+stage-oriented retry design are independent adaptations informed by these
+upstream source paths:
+
+- `panoptikon/src/jobs/files.rs` — content identity and path reconciliation.
+- `panoptikon/src/db/extraction_write.rs` — atomic extraction/provenance
+  records.
+- `panoptikon/src/jobs/extraction.rs` — extraction lifecycle and completion
+  boundaries.
+- `panoptikon/src/pql/embedding_utils.rs` — typed/versioned vector-storage
+  concepts (not copied; sqlite-vec is not bundled in this POC).
+- `panoptikon/src/inferio/registry.rs`, `manager.rs`, and `worker.rs` — model
+  manifest/lifecycle concepts only.
+- `docs/inferio-worker-protocol.md` — future worker-boundary reference only.
+
+No Panoptikon HTTP server, PQL API, desktop-server supervisor, Python setup
+machinery, browser UI, or Python worker code is included in Recall.
+
+Modifications in Recall: the concepts above were reduced to local, in-process
+Tauri/Rust and SQLite workflows.  Recall does not require a Python runtime.

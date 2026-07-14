@@ -9,6 +9,8 @@ pub mod category_prompts;
 pub mod classify;
 pub mod encoder;
 pub mod preprocess;
+pub mod tagger;
 
 pub use classify::PromptBank;
 pub use encoder::VisualRuntime;
+pub use tagger::VisualTaggerRuntime;

@@ -31,6 +31,8 @@ pub struct AppCore {
     pub ai: RwLock<Option<Arc<AiRuntime>>>,
     /// Optional visual (MobileCLIP2) runtime — separate space from `ai`.
     pub visual: RwLock<Option<Arc<visual::VisualRuntime>>>,
+    /// Optional ONNX visual tagger runtime for model-produced image tags.
+    pub visual_tagger: RwLock<Option<Arc<visual::VisualTaggerRuntime>>>,
     /// Cached zero-shot prompt embeddings; rebuilt when the visual model or
     /// prompt bank changes.
     pub visual_prompts: RwLock<Option<Arc<visual::PromptBank>>>,
@@ -103,6 +105,19 @@ pub fn run() {
                     None
                 }
             };
+            let visual_tagger_runtime = match ai::selection(&db_path)
+                .and_then(|selected| ai::load_visual_tagger_for_selection(&model_dir, &selected))
+            {
+                Ok(Some(runtime)) => {
+                    eprintln!("[visual-tags] runtime loaded");
+                    Some(runtime)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    eprintln!("[visual-tags] runtime FAILED to load: {error}");
+                    None
+                }
+            };
 
             if db::setting(&connection, "model_state", "missing")
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?
@@ -124,8 +139,33 @@ pub fn run() {
                 model_installing: AtomicBool::new(false),
                 ai: RwLock::new(runtime),
                 visual: RwLock::new(visual_runtime),
+                visual_tagger: RwLock::new(visual_tagger_runtime),
                 visual_prompts: RwLock::new(None),
             });
+            if core.visual.read().is_some() {
+                let selected = ai::selection(&core.db_path)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let queued = db::queue_stale_visual_reindex(
+                    &core.db_path,
+                    &selected.visual_model_id,
+                    ai::VISUAL_MODEL_VERSION,
+                )
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if queued > 0 {
+                    eprintln!("[visual] queued {queued} stale image(s) for pipeline refresh");
+                }
+            }
+            if core.visual_tagger.read().is_some() {
+                let queued = db::queue_stale_visual_tagging_reindex(
+                    &core.db_path,
+                    ai::VISUAL_TAGGER_GENERAL,
+                    ai::VISUAL_TAGGER_VERSION,
+                )
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if queued > 0 {
+                    eprintln!("[visual-tags] queued {queued} stale image(s) for tag refresh");
+                }
+            }
             app.manage(core.clone());
             if !paused {
                 indexer::start_worker(app.handle().clone(), core);
@@ -150,6 +190,7 @@ pub fn run() {
             commands::search_files,
             commands::search_files_debug,
             commands::get_visual_diagnostics,
+            commands::reindex_visual_library,
             commands::open_source_file,
             commands::reveal_source_file,
             commands::copy_source_path,

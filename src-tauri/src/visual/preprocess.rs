@@ -20,12 +20,8 @@ fn resize_and_center_crop(image: &RgbImage) -> RgbImage {
     let scale = INPUT_SIZE as f32 / w.min(h) as f32;
     let new_w = ((w as f32 * scale).round() as u32).max(INPUT_SIZE);
     let new_h = ((h as f32 * scale).round() as u32).max(INPUT_SIZE);
-    let resized = image::imageops::resize(
-        image,
-        new_w,
-        new_h,
-        image::imageops::FilterType::CatmullRom,
-    );
+    let resized =
+        image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::CatmullRom);
     let x = (new_w - INPUT_SIZE) / 2;
     let y = (new_h - INPUT_SIZE) / 2;
     image::imageops::crop_imm(&resized, x, y, INPUT_SIZE, INPUT_SIZE).to_image()

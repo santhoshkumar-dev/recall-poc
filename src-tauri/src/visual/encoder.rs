@@ -4,7 +4,11 @@
 //! produces L2-normalized 512-d embeddings in a shared cross-modal space —
 //! entirely separate from the E5 text space.
 
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use image::RgbImage;
 use ndarray::{Array, Array2};
@@ -25,6 +29,55 @@ pub const EMBED_DIMS: usize = 512;
 /// Bound visual inference to a single image at a time (memory-friendly, and the
 /// indexing worker is single-threaded anyway).
 static INFER_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+const TEXT_CACHE_CAPACITY: usize = 128;
+const TEXT_CACHE_TTL: Duration = Duration::from_secs(20 * 60);
+
+struct CachedTextEmbedding {
+    vector: Vec<f32>,
+    touched_at: Instant,
+    sequence: u64,
+}
+
+#[derive(Default)]
+struct TextEmbeddingCache {
+    values: HashMap<String, CachedTextEmbedding>,
+    sequence: u64,
+}
+
+impl TextEmbeddingCache {
+    fn get(&mut self, query: &str) -> Option<Vec<f32>> {
+        let now = Instant::now();
+        self.values
+            .retain(|_, value| now.duration_since(value.touched_at) <= TEXT_CACHE_TTL);
+        let value = self.values.get_mut(query)?;
+        self.sequence += 1;
+        value.sequence = self.sequence;
+        value.touched_at = now;
+        Some(value.vector.clone())
+    }
+
+    fn insert(&mut self, query: String, vector: Vec<f32>) {
+        self.sequence += 1;
+        if self.values.len() >= TEXT_CACHE_CAPACITY && !self.values.contains_key(&query) {
+            if let Some(oldest) = self
+                .values
+                .iter()
+                .min_by_key(|(_, value)| value.sequence)
+                .map(|(key, _)| key.clone())
+            {
+                self.values.remove(&oldest);
+            }
+        }
+        self.values.insert(
+            query,
+            CachedTextEmbedding {
+                vector,
+                touched_at: Instant::now(),
+                sequence: self.sequence,
+            },
+        );
+    }
+}
 
 pub struct VisualRuntime {
     vision: Mutex<Session>,
@@ -34,6 +87,7 @@ pub struct VisualRuntime {
     text_inputs: Vec<String>,
     pad_id: u32,
     dims: usize,
+    text_cache: Mutex<TextEmbeddingCache>,
 }
 
 impl VisualRuntime {
@@ -49,9 +103,7 @@ impl VisualRuntime {
         let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| RecallError::Message(format!("Could not load CLIP tokenizer: {e}")))?;
         // Fixed 77-token context: pad + truncate.
-        let pad_id = tokenizer
-            .token_to_id("<|endoftext|>")
-            .unwrap_or(0);
+        let pad_id = tokenizer.token_to_id("<|endoftext|>").unwrap_or(0);
         tokenizer.with_padding(Some(tokenizers::PaddingParams {
             strategy: tokenizers::PaddingStrategy::Fixed(CONTEXT_LENGTH),
             pad_id,
@@ -77,6 +129,7 @@ impl VisualRuntime {
             text_inputs,
             pad_id,
             dims: EMBED_DIMS,
+            text_cache: Mutex::new(TextEmbeddingCache::default()),
         })
     }
 
@@ -96,6 +149,12 @@ impl VisualRuntime {
 
     /// Embed a text query in the CLIP text space → L2-normalized 512-d vector.
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let cache_key = text.trim().to_lowercase();
+        if !cache_key.is_empty() {
+            if let Some(vector) = self.text_cache.lock().get(&cache_key) {
+                return Ok(vector);
+            }
+        }
         let _guard = INFER_LOCK.lock();
         let encoding = self
             .tokenizer
@@ -140,7 +199,11 @@ impl VisualRuntime {
         };
         let _ = self.pad_id;
         let vector = pooled_embedding(&outputs, self.dims)?;
-        Ok(preprocess::l2_normalize(vector))
+        let vector = preprocess::l2_normalize(vector);
+        if !cache_key.is_empty() {
+            self.text_cache.lock().insert(cache_key, vector.clone());
+        }
+        Ok(vector)
     }
 }
 
@@ -184,4 +247,18 @@ fn pooled_embedding(outputs: &ort::session::SessionOutputs, dims: usize) -> Resu
         }
     }
     first.ok_or_else(|| RecallError::Message("Model produced no float output".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_embedding_cache_returns_a_copy() {
+        let mut cache = TextEmbeddingCache::default();
+        cache.insert("train ticket".into(), vec![0.1, 0.2]);
+        let mut first = cache.get("train ticket").expect("cached vector");
+        first[0] = 9.0;
+        assert_eq!(cache.get("train ticket"), Some(vec![0.1, 0.2]));
+    }
 }

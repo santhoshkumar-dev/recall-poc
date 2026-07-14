@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "purpose": "Deterministic local retrieval regression manifest for the Recall hackathon POC.",
+  "metrics": ["precision_at_1", "precision_at_5", "precision_at_10", "recall_at_10", "mrr", "latency_ms", "indexing_time_ms", "peak_ram_mb", "model_load_ms", "database_bytes", "vector_bytes"],
+  "requiredQueries": [
+    { "query": "train ticket", "expectedDocumentTypes": ["train_ticket"], "requiredEvidence": ["document_type", "exact_text", "entity"] },
+    { "query": "receipt", "expectedDocumentTypes": ["receipt"], "requiredEvidence": ["document_type"] },
+    { "query": "invoice", "expectedDocumentTypes": ["invoice"], "requiredEvidence": ["document_type", "entity"] },
+    { "query": "hotel booking", "expectedDocumentTypes": ["hotel_booking"], "requiredEvidence": ["document_type"] },
+    { "query": "React error", "requiredEvidence": ["exact_text"] },
+    { "query": "Wi-Fi password screenshot", "requiredEvidence": ["exact_text"] }
+  ],
+  "acceptance": {
+    "trainTicketMaxRank": 5,
+    "excludeUnrelatedVisualOnlyTicketDistractors": true
+  }
+}
