@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Clipboard, ExternalLink, FileText, FolderSearch, Search, Sparkles, FlaskConical } from "lucide-react";
 import { recallApi } from "@/lib/tauri";
 import type { MatchReason, SearchDebugReport, SearchResult } from "@/lib/types";
@@ -24,6 +24,7 @@ const MATCH_REASON_LABEL: Record<MatchReason, string> = {
 };
 
 export function SearchView() {
+  const isDevelopment = process.env.NODE_ENV !== "production";
   const { folders, model, bootstrap } = useRecallStore();
   const [query, setQuery] = useState("");
   const [folderId, setFolderId] = useState("");
@@ -41,7 +42,7 @@ export function SearchView() {
     setLoading(true); setError(undefined); setSearched(true); setReport(undefined);
     const filters = { folderId: folderId || undefined, extensions: extension ? [extension] : [] };
     try {
-      if (devMode) {
+      if (isDevelopment && devMode) {
         const debug = await recallApi.searchDebug(query.trim(), filters);
         setReport(debug);
         setResults(debug.results);
@@ -63,8 +64,8 @@ export function SearchView() {
         <div className="flex items-center gap-3 px-3"><Search className="text-black/35" /><input aria-label="Search your files" value={query} onChange={(e) => setQuery(e.target.value)} className="h-16 min-w-0 flex-1 bg-transparent text-xl outline-none placeholder:text-black/25" placeholder="Try “train ticket for Bengaluru”" /><Button size="lg" disabled={loading || !query.trim()}>{loading ? "Searching…" : "Search"}</Button></div>
         <div className="flex flex-wrap gap-2 border-t border-black/10 p-3">
           <select aria-label="Filter by folder" value={folderId} onChange={(e) => setFolderId(e.target.value)} className="h-9 rounded-full border border-black/10 bg-white px-4 text-sm"><option value="">All folders</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.path}</option>)}</select>
-          <select aria-label="Filter by file type" value={extension} onChange={(e) => setExtension(e.target.value)} className="h-9 rounded-full border border-black/10 bg-white px-4 text-sm"><option value="">All file types</option>{["txt", "md", "pdf", "png", "jpg", "jpeg", "webp"].map((ext) => <option key={ext} value={ext}>.{ext}</option>)}</select>
-          <label className="ml-auto flex items-center gap-2 rounded-full border border-black/10 bg-white px-4 text-sm text-black/60"><input type="checkbox" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} /><FlaskConical size={14} /> Retrieval inspector</label>
+          <select aria-label="Filter by file type" value={extension} onChange={(e) => setExtension(e.target.value)} className="h-9 rounded-full border border-black/10 bg-white px-4 text-sm"><option value="">All file types</option>{["txt", "md", "pdf", "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"].map((ext) => <option key={ext} value={ext}>.{ext}</option>)}</select>
+          {isDevelopment && <label className="ml-auto flex items-center gap-2 rounded-full border border-black/10 bg-white px-4 text-sm text-black/60"><input type="checkbox" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} /><FlaskConical size={14} /> Retrieval inspector</label>}
         </div>
       </form>
       <div className="mt-5 flex items-center justify-between text-sm text-black/45"><span>{bootstrap?.indexedFiles ?? 0} locally indexed files</span>{searched && !loading && <span>{results.length} results</span>}</div>
@@ -72,7 +73,7 @@ export function SearchView() {
       {!searched && <Empty icon={Sparkles} title="Search by meaning, not filenames" body="Recall combines local semantic similarity with exact keyword matches and always shows the source." />}
       {searched && !loading && !error && results.length === 0 && <Empty icon={FolderSearch} title="No sufficiently relevant local files were found" body="Try broader wording, remove a filter, or check the Library for indexing failures." />}
       {report && <Inspector report={report} />}
-      <div className="mt-7 space-y-4">
+      <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
         {results.map((result) => <ResultCard key={result.assetId} result={result} />)}
       </div>
     </div>
@@ -92,6 +93,8 @@ function Inspector({ report }: { report: SearchDebugReport }) {
         {report.visualPrompts.length > 0 && <div><span className="text-black/45">Visual prompts:</span> {report.visualPrompts.join(" · ")}</div>}
         {report.expandedCategories.length > 0 && <div><span className="text-black/45">Document hints:</span> {report.expandedCategories.map((c) => <Badge key={c} tone="neutral">{c}</Badge>)}</div>}
         {report.appliedFilters.length > 0 && <div><span className="text-black/45">Filters:</span> {report.appliedFilters.join("; ")}</div>}
+        <div><span className="text-black/45">Profiles:</span> {report.imageProfileId} · {report.textProfileId}</div>
+        <div><span className="text-black/45">Query vector:</span> {report.queryEmbeddingDims ?? "-"}d · norm {report.queryEmbeddingNorm?.toFixed(3) ?? "-"} · finite {String(report.queryEmbeddingFinite ?? false)} · tokens {report.visualTokenCount ?? "-"}</div>
       </div>
       <div className="mt-4 grid gap-4 md:grid-cols-2">
         {report.channels.map((channel) => (
@@ -132,11 +135,51 @@ function Inspector({ report }: { report: SearchDebugReport }) {
 }
 
 function ResultCard({ result }: { result: SearchResult }) {
-  const confidenceLabel = result.confidence === "strong" ? "Strong match" : "Moderate match";
+  const confidenceLabel = result.confidence === "strong" ? "Strong" : result.confidence === "moderate" ? "Moderate" : "Visual match";
+  const primaryReason = result.matchReasons?.[0];
   return (
-    <article className="panel p-6 transition hover:-translate-y-0.5 hover:bg-white">
-      <div className="flex items-start gap-4"><div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-lime/50"><FileText size={22} /></div><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h2 className="truncate text-lg font-semibold">{result.filename}</h2><Badge>{result.extension?.toUpperCase() ?? "FILE"}</Badge>{result.pageNumber && <Badge>Page {result.pageNumber}</Badge>}<Badge tone={result.confidence === "strong" ? "good" : "neutral"}>{confidenceLabel}</Badge></div><p className="mt-1 truncate text-xs text-black/40">{result.sourcePath}</p>{result.matchReasons?.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-1.5"><span className="text-xs text-black/40">Matched because:</span>{result.matchReasons.map((reason) => <Badge key={reason} tone="neutral">{MATCH_REASON_LABEL[reason]}</Badge>)}</div>}{result.topVisualTags.length > 0 && <div className="mt-3 flex flex-wrap items-center gap-1.5"><span className="text-xs text-black/40">Visual tags:</span>{result.topVisualTags.slice(0, 5).map((tag) => <Badge key={`${tag.regionId}-${tag.label}`} tone="neutral">{tag.label}</Badge>)}</div>}<p className="mt-4 max-w-4xl text-sm leading-7 text-black/65">{result.snippet}</p><div className="mt-5 flex flex-wrap gap-2"><Button size="sm" onClick={() => void recallApi.open(result.assetId)}><ExternalLink size={15} /> Open</Button><Button size="sm" variant="secondary" onClick={() => void recallApi.reveal(result.assetId)}><FolderSearch size={15} /> Show in folder</Button><Button size="sm" variant="ghost" onClick={() => void recallApi.copyPath(result.assetId)}><Clipboard size={15} /> Copy path</Button></div></div></div>
+    <article className="panel group overflow-hidden transition hover:-translate-y-0.5 hover:bg-white">
+      <ResultThumbnail result={result} />
+      <div className="p-4">
+        <div className="flex min-w-0 items-center gap-2">
+          <h2 className="min-w-0 flex-1 truncate font-semibold">{result.filename}</h2>
+          <Badge>{result.extension?.toUpperCase() ?? "FILE"}</Badge>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-black/45">
+          {primaryReason && <span>{MATCH_REASON_LABEL[primaryReason]}</span>}
+          <span>·</span><span>{confidenceLabel}</span>
+          {result.alternateLocationCount > 0 && <><span>·</span><span>+{result.alternateLocationCount} copies</span></>}
+        </div>
+        <div className="mt-4 flex items-center gap-1">
+          <Button size="sm" onClick={() => void recallApi.open(result.assetId)}><ExternalLink size={14} /> Open</Button>
+          <Button aria-label="Show in folder" title="Show in folder" size="sm" variant="ghost" onClick={() => void recallApi.reveal(result.assetId)}><FolderSearch size={15} /></Button>
+          <Button aria-label="Copy path" title="Copy path" size="sm" variant="ghost" onClick={() => void recallApi.copyPath(result.assetId)}><Clipboard size={15} /></Button>
+        </div>
+      </div>
     </article>
+  );
+}
+
+function ResultThumbnail({ result }: { result: SearchResult }) {
+  const [url, setUrl] = useState<string>();
+  useEffect(() => {
+    if (!result.thumbnailAvailable) return;
+    let active = true;
+    let objectUrl: string | undefined;
+    void recallApi.thumbnail(result.assetId).then((bytes) => {
+      if (!active) return;
+      objectUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "image/png" }));
+      setUrl(objectUrl);
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [result.assetId, result.thumbnailAvailable]);
+  return (
+    <div className="flex aspect-[4/3] items-center justify-center overflow-hidden bg-black/[0.04]">
+      {url ? <img src={url} alt="" className="h-full w-full object-cover transition duration-300 group-hover:scale-[1.02]" /> : <FileText size={28} className="text-black/25" />}
+    </div>
   );
 }
 

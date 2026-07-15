@@ -284,6 +284,19 @@ pub fn content_terms(query_lower: &str) -> Vec<String> {
     out
 }
 
+fn canonical_visual_term(term: &str) -> String {
+    if term.len() > 4 && term.ends_with("ies") {
+        return format!("{}y", &term[..term.len() - 3]);
+    }
+    if term.len() > 4 && (term.ends_with("sses") || term.ends_with("xes")) {
+        return term[..term.len() - 2].to_string();
+    }
+    if term.len() > 3 && term.ends_with('s') && !term.ends_with("ss") && !term.ends_with("us") {
+        return term[..term.len() - 1].to_string();
+    }
+    term.to_string()
+}
+
 /// A structured, deterministic plan for one query. Drives conjunction FTS,
 /// document-intent scoring, and evidence gating in [`crate::fusion`].
 #[derive(Debug, Clone)]
@@ -303,7 +316,7 @@ pub struct QueryPlan {
     pub intents: Vec<QueryIntent>,
     pub primary_intent: QueryIntent,
     pub implied_extensions: Vec<String>,
-    /// Whether a strong MobileCLIP-only signal may qualify a result.
+    /// Whether MobileCLIP candidates may be returned without text evidence.
     pub visual_query: bool,
     /// Prompt variants embedded in the MobileCLIP text space.
     pub visual_prompts: Vec<String>,
@@ -346,14 +359,19 @@ pub fn plan(query: &str) -> QueryPlan {
         analysis.intents.push(QueryIntent::Mixed);
     }
     let dominant_intent = primary_intent(&analysis.intents);
-    let content_phrase = required_terms.join(" ");
-    let mut visual_prompts = vec![raw.clone()];
-    if visual_query && !content_phrase.is_empty() {
-        let photo_prompt = format!("a photo of {content_phrase}");
-        if !visual_prompts.contains(&photo_prompt) {
-            visual_prompts.push(photo_prompt);
-        }
-    }
+    let canonical_visual_phrase = required_terms
+        .iter()
+        .map(|term| canonical_visual_term(term))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let visual_prompts = if visual_query && !canonical_visual_phrase.is_empty() {
+        vec![
+            canonical_visual_phrase.clone(),
+            format!("a photo of {canonical_visual_phrase}"),
+        ]
+    } else {
+        vec![raw.clone()]
+    };
     QueryPlan {
         raw,
         exact_phrases,
@@ -446,6 +464,16 @@ mod tests {
                 .iter()
                 .any(|prompt| prompt.starts_with("a photo of")));
         }
+    }
+
+    #[test]
+    fn singular_and_plural_visual_queries_share_prompts() {
+        assert_eq!(plan("cat").visual_prompts, plan("cats").visual_prompts);
+        assert_eq!(plan("dog").visual_prompts, plan("dogs").visual_prompts);
+        assert_eq!(
+            plan("building").visual_prompts,
+            plan("buildings").visual_prompts
+        );
     }
 
     #[test]

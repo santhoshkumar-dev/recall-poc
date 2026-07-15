@@ -19,6 +19,7 @@ import { Badge } from "./ui/badge";
 import { Progress } from "./ui/progress";
 
 export function PrivacyView({ onRefresh }: { onRefresh: () => Promise<void> }) {
+  const isDevelopment = process.env.NODE_ENV !== "production";
   const model = useRecallStore((state) => state.model);
   const bootstrap = useRecallStore((state) => state.bootstrap);
   const indexing = useRecallStore((state) => state.indexing);
@@ -43,13 +44,13 @@ export function PrivacyView({ onRefresh }: { onRefresh: () => Promise<void> }) {
   }, []);
 
   const loadDiagnostics = useCallback(async () => {
-    if (!isTauri()) return;
+    if (!isTauri() || !isDevelopment) return;
     try {
       setDiagnostics(await recallApi.visualDiagnostics());
     } catch {
       /* diagnostics are best-effort */
     }
-  }, []);
+  }, [isDevelopment]);
 
   useEffect(() => {
     void loadDiagnostics();
@@ -253,13 +254,13 @@ export function PrivacyView({ onRefresh }: { onRefresh: () => Promise<void> }) {
         </Button>
       </section>
 
-      <VisualDiagnosticsPanel
+      {isDevelopment && <VisualDiagnosticsPanel
         diagnostics={diagnostics}
         onRefresh={loadDiagnostics}
         onReindex={reindexVisualLibrary}
         reindexing={visualReindexing}
         reindexDisabled={busy || visualReindexing || processing || (indexing?.pending ?? 0) > 0}
-      />
+      />}
 
       <section className="panel mt-8 p-6">
         <p className="eyebrow">Answer generation</p>

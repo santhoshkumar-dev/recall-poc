@@ -7,6 +7,8 @@
 use image::RgbImage;
 use ndarray::{Array, Array4};
 
+use crate::error::{RecallError, Result};
+
 /// MobileCLIP2-S0 square input side.
 pub const INPUT_SIZE: u32 = 256;
 
@@ -42,15 +44,34 @@ pub fn image_to_tensor(image: &RgbImage) -> Array4<f32> {
     tensor
 }
 
-/// L2-normalize a vector in place-safe form; zero vectors are returned as-is.
-pub fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > f32::EPSILON {
-        for x in &mut v {
-            *x /= norm;
-        }
+/// Validate a projected embedding and return an L2-normalized vector.
+///
+/// Invalid vectors must never reach SQLite or ranking: a zero/NaN vector can
+/// otherwise look like a legitimate low-confidence match and a wrong-sized
+/// vector silently corrupts cross-model comparisons.
+pub fn validate_and_normalize(mut v: Vec<f32>, expected_dims: usize) -> Result<Vec<f32>> {
+    if v.len() != expected_dims {
+        return Err(RecallError::Message(format!(
+            "Embedding dimension mismatch: expected {expected_dims}, got {}",
+            v.len()
+        )));
     }
-    v
+    if !v.iter().all(|value| value.is_finite()) {
+        return Err(RecallError::Message(
+            "Embedding contains a non-finite value".into(),
+        ));
+    }
+    let norm_sq = v.iter().map(|value| value * value).sum::<f32>();
+    if !norm_sq.is_finite() || norm_sq <= f32::EPSILON {
+        return Err(RecallError::Message(
+            "Embedding has zero or invalid norm".into(),
+        ));
+    }
+    let norm = norm_sq.sqrt();
+    for value in &mut v {
+        *value /= norm;
+    }
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -68,7 +89,14 @@ mod tests {
 
     #[test]
     fn normalizes_unit_length() {
-        let n = l2_normalize(vec![3.0, 4.0]);
+        let n = validate_and_normalize(vec![3.0, 4.0], 2).unwrap();
         assert!((n[0] - 0.6).abs() < 1e-6 && (n[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_invalid_embeddings() {
+        assert!(validate_and_normalize(vec![0.0, 0.0], 2).is_err());
+        assert!(validate_and_normalize(vec![f32::NAN, 1.0], 2).is_err());
+        assert!(validate_and_normalize(vec![1.0], 2).is_err());
     }
 }

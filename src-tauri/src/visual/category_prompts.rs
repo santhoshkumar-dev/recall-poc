@@ -7,7 +7,7 @@
 //! the image encoder). Do NOT wire prompts directly into retrieval logic.
 
 /// Bump when prompts change so cached prompt embeddings + classifications refresh.
-pub const PROMPT_BANK_VERSION: &str = "1";
+pub const PROMPT_BANK_VERSION: &str = "2";
 
 /// (category_label, prompts). Ordered but order is not significant.
 pub const CATEGORY_PROMPTS: &[(&str, &[&str])] = &[

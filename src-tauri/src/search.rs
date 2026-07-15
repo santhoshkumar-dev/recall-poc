@@ -22,11 +22,14 @@ pub(crate) struct Candidate {
 pub(crate) fn load_candidates(
     connection: &rusqlite::Connection,
     filters: &SearchFilters,
+    embedding_profile_id: &str,
 ) -> Result<Vec<Candidate>> {
     let mut statement = connection.prepare(
         r#"
-      SELECT c.id,c.asset_id,a.folder_id,a.extension,c.page_number,c.text,c.embedding
-      FROM chunks c JOIN assets a ON a.id=c.asset_id WHERE a.available=1 AND a.status='indexed'
+      SELECT c.id,c.asset_id,a.folder_id,a.extension,c.page_number,c.text,c.embedding,
+             c.embedding_profile_id,c.embedding_dimensions
+      FROM chunks c JOIN assets a ON a.id=c.asset_id
+      WHERE a.available=1 AND a.status='indexed'
     "#,
     )?;
     let rows = statement.query_map([], |r| {
@@ -37,9 +40,17 @@ pub(crate) fn load_candidates(
             extension: r.get(3)?,
             page_number: r.get(4)?,
             text: r.get(5)?,
-            embedding: r
-                .get::<_, Option<Vec<u8>>>(6)?
-                .map(|blob| db::blob_to_embedding(&blob)),
+            embedding: {
+                let blob = r.get::<_, Option<Vec<u8>>>(6)?;
+                let profile = r.get::<_, Option<String>>(7)?;
+                let dims = r.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as usize;
+                match (blob, profile) {
+                    (Some(blob), Some(profile)) if profile == embedding_profile_id => {
+                        db::try_blob_to_embedding(&blob, dims).ok()
+                    }
+                    _ => None,
+                }
+            },
         })
     })?;
     Ok(rows

@@ -57,8 +57,21 @@ export interface IndexingStatus {
   failed: number;
   backgroundPending: number;
   backgroundProcessing: number;
+  waitingModel: number;
+  reindexGeneration: number;
+  reindexPending: number;
+  reindexCompleted: number;
+  reindexFailed: number;
   currentStage?: string;
   currentFile?: string;
+}
+
+export interface AssetStageStatus {
+  stage: string;
+  state: string;
+  attempts: number;
+  errorMessage?: string;
+  updatedAt: string;
 }
 
 export interface AssetSummary {
@@ -134,7 +147,9 @@ export interface SearchResult {
   matchReasons: MatchReason[];
   topCategories: VisualCategory[];
   topVisualTags: VisualTag[];
-  confidence: "strong" | "moderate";
+  confidence: "strong" | "moderate" | "candidate";
+  thumbnailAvailable: boolean;
+  alternateLocationCount: number;
 }
 
 export interface ChannelResult {
@@ -163,6 +178,13 @@ export interface SearchDebugReport {
   channels: ChannelDiagnostics[];
   results: SearchResult[];
   totalLatencyMs: number;
+  modelRevision: string;
+  imageProfileId: string;
+  textProfileId: string;
+  visualTokenCount?: number;
+  queryEmbeddingDims?: number;
+  queryEmbeddingNorm?: number;
+  queryEmbeddingFinite?: boolean;
 }
 
 export interface VisualDiagnostics {

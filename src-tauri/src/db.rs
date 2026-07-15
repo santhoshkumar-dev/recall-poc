@@ -18,7 +18,7 @@ pub fn connect(path: &Path) -> Result<Connection> {
 }
 
 /// Latest schema version. Bump when adding a migration step below.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 pub fn migrate(path: &Path) -> Result<()> {
     let connection = connect(path)?;
@@ -264,6 +264,92 @@ pub fn migrate(path: &Path) -> Result<()> {
         )?;
         version = 6;
     }
+    if version < 7 {
+        connection.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS embedding_profiles (
+              id TEXT PRIMARY KEY,
+              role TEXT NOT NULL,
+              model_id TEXT NOT NULL,
+              checkpoint_revision TEXT NOT NULL,
+              artifact_hashes_json TEXT NOT NULL,
+              dimensions INTEGER NOT NULL,
+              preprocessing_version TEXT NOT NULL,
+              tokenizer_version TEXT,
+              schema_version TEXT NOT NULL,
+              space_id TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_embedding_profiles_space ON embedding_profiles(space_id, role);
+            "#,
+        )?;
+        if !column_exists(&connection, "image_embeddings", "profile_id")? {
+            connection.execute_batch(
+                "ALTER TABLE image_embeddings ADD COLUMN profile_id TEXT REFERENCES embedding_profiles(id);",
+            )?;
+        }
+        if !column_exists(&connection, "chunks", "embedding_profile_id")? {
+            connection.execute_batch(
+                "ALTER TABLE chunks ADD COLUMN embedding_profile_id TEXT REFERENCES embedding_profiles(id);",
+            )?;
+        }
+        if !column_exists(&connection, "chunks", "embedding_dimensions")? {
+            connection
+                .execute_batch("ALTER TABLE chunks ADD COLUMN embedding_dimensions INTEGER;")?;
+        }
+        if !column_exists(&connection, "extraction_stage_jobs", "reindex_generation")? {
+            connection.execute_batch(
+                "ALTER TABLE extraction_stage_jobs ADD COLUMN reindex_generation INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_image_emb_profile ON image_embeddings(profile_id);
+             CREATE INDEX IF NOT EXISTS idx_chunks_embedding_profile ON chunks(embedding_profile_id);
+             DELETE FROM visual_classifications;
+             DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE source='visual_tags');
+             DELETE FROM chunks WHERE source='visual_tags';
+             UPDATE chunks SET embedding=NULL, embedding_profile_id=NULL, embedding_dimensions=NULL WHERE embedding IS NOT NULL;",
+        )?;
+        version = 7;
+    }
+    // Register the built-in paired MobileCLIP profiles. Artifact hashes are
+    // part of the identity; image and query profiles share one vector space.
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT OR IGNORE INTO embedding_profiles(id,role,model_id,checkpoint_revision,artifact_hashes_json,dimensions,preprocessing_version,tokenizer_version,schema_version,space_id,created_at)
+         VALUES (?1,'image','mobileclip2-s0','4966d353f43c64efd99580a758f946950216b6e6',?2,512,'mobileclip-s0-rgb-center-crop-256-v1',NULL,'1',?3,?4)",
+        params![crate::ai::MOBILECLIP_IMAGE_PROFILE_ID,
+          "{\"vision_model.onnx\":\"13d20ebfa8a8f63890eb2727fe4dc63009ff970f43e0f7d9d2ed999659f70c8a\"}",
+          crate::ai::VISUAL_SPACE_ID, now],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO embedding_profiles(id,role,model_id,checkpoint_revision,artifact_hashes_json,dimensions,preprocessing_version,tokenizer_version,schema_version,space_id,created_at)
+         VALUES (?1,'query','mobileclip2-s0','4966d353f43c64efd99580a758f946950216b6e6',?2,512,'mobileclip-s0-text-v1','clip-bpe-zero-pad-77-v1','1',?3,?4)",
+        params![crate::ai::MOBILECLIP_TEXT_PROFILE_ID,
+          "{\"text_model.onnx\":\"df590d47744f2ee9f3ccb67c4414d17419568c05bca0c4d166f2faeedf8b92f3\",\"tokenizer.json\":\"b556ac8c99757ffb677208af34bc8c6721572114111a6e0aaf5fa69ff0b8d842\"}",
+          crate::ai::VISUAL_SPACE_ID, now],
+    )?;
+    // A legacy image row is reusable only when every stored invariant that can
+    // be proven locally matches the pinned vision profile.
+    let legacy_rows: Vec<(i64, Vec<u8>)> = {
+        let mut statement = connection.prepare(
+            "SELECT rowid,embedding FROM image_embeddings
+             WHERE model_id='mobileclip2-s0' AND model_version='2'
+               AND dimensions=512 AND profile_id IS NULL",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    for (rowid, blob) in legacy_rows {
+        if try_blob_to_embedding(&blob, 512).is_ok() {
+            connection.execute(
+                "UPDATE image_embeddings SET profile_id=?2 WHERE rowid=?1",
+                params![rowid, crate::ai::MOBILECLIP_IMAGE_PROFILE_ID],
+            )?;
+        }
+    }
     let _ = version;
     connection.execute(
         "UPDATE extraction_stage_jobs SET state='pending', error_message='Recovered after application restart' WHERE state='processing'",
@@ -399,6 +485,27 @@ pub fn indexing_status(path: &Path) -> Result<IndexingStatus> {
         |r| r.get::<_, i64>(0),
     )?;
     let failed = asset_count("failed")? + failed_stages;
+    let waiting_model = connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM indexing_jobs WHERE state='waiting_model') +
+                (SELECT COUNT(*) FROM extraction_stage_jobs WHERE state='waiting_model')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let reindex_generation = connection.query_row(
+        "SELECT COALESCE(MAX(reindex_generation),0) FROM extraction_stage_jobs",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let reindex_count = |state: &str| -> rusqlite::Result<i64> {
+        if reindex_generation == 0 {
+            return Ok(0);
+        }
+        connection.query_row(
+            "SELECT COUNT(*) FROM extraction_stage_jobs WHERE reindex_generation=?1 AND state=?2",
+            params![reindex_generation, state],
+            |row| row.get(0),
+        )
+    };
     let current = connection
         .query_row(
             "SELECT filename, stage FROM (
@@ -422,9 +529,39 @@ pub fn indexing_status(path: &Path) -> Result<IndexingStatus> {
         failed,
         background_pending,
         background_processing,
+        waiting_model,
+        reindex_generation,
+        reindex_pending: reindex_count("pending")?
+            + reindex_count("processing")?
+            + reindex_count("waiting_model")?,
+        reindex_completed: reindex_count("indexed")?,
+        reindex_failed: reindex_count("failed")?,
         current_stage,
         current_file,
     })
+}
+
+pub fn asset_pipeline_status(
+    path: &Path,
+    asset_id: &str,
+) -> Result<Vec<crate::types::AssetStageStatus>> {
+    let connection = connect(path)?;
+    let mut statement = connection.prepare(
+        "SELECT stage,state,attempts,error_message,updated_at FROM indexing_jobs WHERE asset_id=?1
+         UNION ALL
+         SELECT stage,state,attempts,error_message,updated_at FROM extraction_stage_jobs WHERE asset_id=?1
+         ORDER BY updated_at,stage",
+    )?;
+    let rows = statement.query_map([asset_id], |row| {
+        Ok(crate::types::AssetStageStatus {
+            stage: row.get(0)?,
+            state: row.get(1)?,
+            attempts: row.get(2)?,
+            error_message: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 /// Internal queue counts include derived extraction stages. Use this for
@@ -520,10 +657,55 @@ pub fn queue_extraction_stage(
         "INSERT INTO extraction_stage_jobs(id,asset_id,stage,model_id,pipeline_version,state,attempts,created_at,updated_at)
          VALUES (?1,?2,?3,?4,?5,'pending',0,?6,?6)
          ON CONFLICT(asset_id,stage,model_id,pipeline_version) DO UPDATE SET
-           state='pending',attempts=0,error_message=NULL,updated_at=excluded.updated_at",
+           state='pending',attempts=0,error_message=NULL,updated_at=excluded.updated_at,reindex_generation=0",
         params![uuid::Uuid::new_v4().to_string(), asset_id, stage, model_id, pipeline_version, now],
     )?;
     Ok(())
+}
+
+pub fn resume_waiting_model_jobs(path: &Path) -> Result<()> {
+    let connection = connect(path)?;
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "UPDATE indexing_jobs SET state='pending',error_message=NULL,updated_at=?1 WHERE state='waiting_model'",
+        [now.clone()],
+    )?;
+    connection.execute(
+        "UPDATE extraction_stage_jobs SET state='pending',attempts=0,error_message=NULL,updated_at=?1 WHERE state='waiting_model'",
+        [now],
+    )?;
+    Ok(())
+}
+
+pub fn set_thumbnail_path(path: &Path, asset_id: &str, thumbnail_path: &Path) -> Result<()> {
+    let connection = connect(path)?;
+    connection.execute(
+        "UPDATE assets SET thumbnail_path=?2 WHERE id=?1",
+        params![asset_id, thumbnail_path.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
+pub fn backfill_thumbnail_paths(path: &Path, thumbnail_dir: &Path) -> Result<i64> {
+    let connection = connect(path)?;
+    let asset_ids = {
+        let mut statement = connection
+            .prepare("SELECT id FROM assets WHERE available=1 AND thumbnail_path IS NULL")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut updated = 0;
+    for asset_id in asset_ids {
+        let thumbnail = thumbnail_dir.join(format!("{asset_id}.png"));
+        if thumbnail.is_file() {
+            connection.execute(
+                "UPDATE assets SET thumbnail_path=?2 WHERE id=?1",
+                params![asset_id, thumbnail.to_string_lossy()],
+            )?;
+            updated += 1;
+        }
+    }
+    Ok(updated)
 }
 
 pub fn claim_next_extraction_stage_job(
@@ -534,12 +716,14 @@ pub fn claim_next_extraction_stage_job(
     let candidate = transaction.query_row(
         "SELECT j.id,j.stage,a.id,a.folder_id,a.absolute_path,a.filename,COALESCE(a.extension,'')
          FROM extraction_stage_jobs j JOIN assets a ON a.id=j.asset_id
-         WHERE j.state='pending' AND a.available=1 AND a.status='indexed'
+         WHERE j.state='pending' AND a.available=1
+           AND (a.status='indexed' OR j.stage IN ('visual','visual_regions','recategorize','visual_tagging','visual_region_tagging'))
          ORDER BY CASE j.stage
            WHEN 'visual' THEN 10
            WHEN 'text_embedding' THEN 20
            WHEN 'analysis' THEN 30
            WHEN 'visual_tagging' THEN 40
+           WHEN 'recategorize' THEN 45
            WHEN 'visual_regions' THEN 50
            WHEN 'visual_region_tagging' THEN 60
            ELSE 90
@@ -654,28 +838,64 @@ pub fn asset_text(path: &Path, asset_id: &str) -> Result<String> {
     Ok(texts.join("\n"))
 }
 
-pub fn chunks_without_embeddings(path: &Path, asset_id: &str) -> Result<Vec<(String, String)>> {
+pub fn chunks_without_profile_embeddings(
+    path: &Path,
+    asset_id: &str,
+    profile_id: &str,
+) -> Result<Vec<(String, String)>> {
     let connection = connect(path)?;
     let mut statement = connection.prepare(
-        "SELECT id,text FROM chunks WHERE asset_id=?1 AND embedding IS NULL ORDER BY chunk_index",
+        "SELECT id,text FROM chunks
+         WHERE asset_id=?1 AND (embedding IS NULL OR embedding_profile_id IS NULL OR embedding_profile_id<>?2)
+         ORDER BY chunk_index",
     )?;
-    let rows = statement.query_map([asset_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let rows = statement.query_map(params![asset_id, profile_id], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-pub fn save_chunk_embeddings(path: &Path, values: &[(String, Vec<f32>)]) -> Result<()> {
+pub fn save_chunk_embeddings(
+    path: &Path,
+    profile_id: &str,
+    values: &[(String, Vec<f32>)],
+) -> Result<()> {
     if values.is_empty() {
         return Ok(());
     }
     let mut connection = connect(path)?;
     let transaction = connection.transaction()?;
     for (id, embedding) in values {
+        let embedding =
+            crate::visual::preprocess::validate_and_normalize(embedding.clone(), embedding.len())?;
         transaction.execute(
-            "UPDATE chunks SET embedding=?2 WHERE id=?1",
-            params![id, embedding_to_blob(embedding)],
+            "UPDATE chunks SET embedding=?2,embedding_profile_id=?3,embedding_dimensions=?4 WHERE id=?1",
+            params![id, embedding_to_blob(&embedding), profile_id, embedding.len() as i64],
         )?;
     }
     transaction.commit()?;
+    Ok(())
+}
+
+pub fn ensure_text_embedding_profile(
+    path: &Path,
+    profile_id: &str,
+    model_id: &str,
+    dimensions: usize,
+) -> Result<()> {
+    let connection = connect(path)?;
+    let artifact_hashes = if model_id == crate::ai::E5_SMALL {
+        "{\"model_int8.onnx\":\"4d24e2bc01a447951524466ef533e52944bf48509e6552810bcee1a2711cb02c\"}"
+    } else {
+        "{}"
+    };
+    connection.execute(
+        "INSERT OR IGNORE INTO embedding_profiles(id,role,model_id,checkpoint_revision,artifact_hashes_json,dimensions,preprocessing_version,tokenizer_version,schema_version,space_id,created_at)
+         VALUES (?1,'document',?2,'artifact-sha256',?3,?4,?5,NULL,'1',?6,?7)",
+        params![profile_id, model_id, artifact_hashes, dimensions as i64,
+          format!("e5-prefix-chunks-v{}", crate::ai::CHUNKING_VERSION),
+          profile_id, Utc::now().to_rfc3339()],
+    )?;
     Ok(())
 }
 
@@ -686,6 +906,7 @@ pub fn append_chunk(
     asset_id: &str,
     text: &str,
     embedding: Option<&[f32]>,
+    embedding_profile_id: Option<&str>,
 ) -> Result<()> {
     let connection = connect(path)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -698,8 +919,9 @@ pub fn append_chunk(
         .unwrap_or(0);
     let blob = embedding.map(embedding_to_blob);
     connection.execute(
-        "INSERT INTO chunks(id,asset_id,chunk_index,page_number,text,embedding,source) VALUES (?1,?2,?3,NULL,?4,?5,NULL)",
-        params![id, asset_id, next_index, text, blob],
+        "INSERT INTO chunks(id,asset_id,chunk_index,page_number,text,embedding,source,embedding_profile_id,embedding_dimensions)
+         VALUES (?1,?2,?3,NULL,?4,?5,NULL,?6,?7)",
+        params![id, asset_id, next_index, text, blob, embedding_profile_id, embedding.map(|value| value.len() as i64)],
     )?;
     connection.execute(
         "INSERT INTO chunks_fts(chunk_id,text) VALUES (?1,?2)",
@@ -893,16 +1115,29 @@ const IMAGE_PREDICATE: &str =
 /// OCR stages remain complete; only the requested visual-model output is made
 /// pending again.
 pub fn queue_visual_stage_reindex(path: &Path, model_id: &str, model_version: &str) -> Result<i64> {
+    let generation = {
+        let connection = connect(path)?;
+        connection.query_row(
+            "SELECT COALESCE(MAX(reindex_generation),0)+1 FROM extraction_stage_jobs",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+    };
     let asset_ids = {
         let connection = connect(path)?;
-        let mut statement = connection.prepare(&format!(
-            "SELECT id FROM assets WHERE {IMAGE_PREDICATE} AND status='indexed'"
-        ))?;
+        let mut statement =
+            connection.prepare(&format!("SELECT id FROM assets WHERE {IMAGE_PREDICATE}"))?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     for asset_id in &asset_ids {
         queue_extraction_stage(path, asset_id, "visual", model_id, model_version)?;
+        let connection = connect(path)?;
+        connection.execute(
+            "UPDATE extraction_stage_jobs SET reindex_generation=?4
+             WHERE asset_id=?1 AND stage='visual' AND model_id=?2 AND pipeline_version=?3",
+            params![asset_id, model_id, model_version, generation],
+        )?;
     }
     Ok(asset_ids.len() as i64)
 }
@@ -914,18 +1149,66 @@ pub fn queue_stale_visual_reindex(path: &Path, model_id: &str, model_version: &s
     let asset_ids = {
         let connection = connect(path)?;
         let mut statement = connection.prepare(
-            "SELECT a.id FROM assets a WHERE a.available=1 AND a.status='indexed'
+            "SELECT a.id FROM assets a WHERE a.available=1
              AND LOWER(COALESCE(a.extension,'')) IN ('png','jpg','jpeg','webp','gif','bmp','tif','tiff')
-             AND NOT EXISTS (SELECT 1 FROM image_embeddings ie WHERE ie.asset_id=a.id AND ie.model_id=?1 AND ie.model_version=?2 AND ie.page_number=?3)",
+             AND NOT EXISTS (SELECT 1 FROM image_embeddings ie WHERE ie.asset_id=a.id AND ie.model_id=?1 AND ie.model_version=?2 AND ie.page_number=?3 AND ie.profile_id=?4 AND ie.dimensions=512)",
         )?;
-        let rows = statement
-            .query_map(params![model_id, model_version, WHOLE_IMAGE_PAGE], |row| {
-                row.get::<_, String>(0)
-            })?;
+        let rows = statement.query_map(
+            params![
+                model_id,
+                model_version,
+                WHOLE_IMAGE_PAGE,
+                crate::ai::MOBILECLIP_IMAGE_PROFILE_ID
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     for asset_id in &asset_ids {
         queue_extraction_stage(path, asset_id, "visual", model_id, model_version)?;
+    }
+    Ok(asset_ids.len() as i64)
+}
+
+pub fn queue_stale_text_reindex(path: &Path, model_id: &str, profile_id: &str) -> Result<i64> {
+    let asset_ids = {
+        let connection = connect(path)?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT a.id FROM assets a JOIN chunks c ON c.asset_id=a.id
+             WHERE a.available=1 AND (c.embedding IS NULL OR c.embedding_profile_id IS NULL OR c.embedding_profile_id<>?1)",
+        )?;
+        let rows = statement
+            .query_map([profile_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for asset_id in &asset_ids {
+        queue_extraction_stage(path, asset_id, "text_embedding", model_id, profile_id)?;
+    }
+    Ok(asset_ids.len() as i64)
+}
+
+pub fn queue_missing_visual_categories(path: &Path, model_id: &str) -> Result<i64> {
+    let asset_ids = {
+        let connection = connect(path)?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT ie.asset_id FROM image_embeddings ie JOIN assets a ON a.id=ie.asset_id
+             WHERE a.available=1 AND ie.model_id=?1 AND ie.profile_id=?2
+               AND NOT EXISTS (SELECT 1 FROM visual_classifications vc WHERE vc.asset_id=ie.asset_id AND vc.model_id=?1)",
+        )?;
+        let rows = statement.query_map(
+            params![model_id, crate::ai::MOBILECLIP_IMAGE_PROFILE_ID],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let version = format!(
+        "prompt-{}-text-{}",
+        crate::visual::category_prompts::PROMPT_BANK_VERSION,
+        crate::ai::VISUAL_TEXT_PROFILE_VERSION
+    );
+    for asset_id in &asset_ids {
+        queue_extraction_stage(path, asset_id, "recategorize", model_id, &version)?;
     }
     Ok(asset_ids.len() as i64)
 }
@@ -937,9 +1220,8 @@ pub fn queue_visual_tagging_stage_reindex(
 ) -> Result<i64> {
     let asset_ids = {
         let connection = connect(path)?;
-        let mut statement = connection.prepare(&format!(
-            "SELECT id FROM assets WHERE {IMAGE_PREDICATE} AND status='indexed'"
-        ))?;
+        let mut statement =
+            connection.prepare(&format!("SELECT id FROM assets WHERE {IMAGE_PREDICATE}"))?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -957,7 +1239,7 @@ pub fn queue_stale_visual_tagging_reindex(
     let asset_ids = {
         let connection = connect(path)?;
         let mut statement = connection.prepare(
-            "SELECT a.id FROM assets a WHERE a.available=1 AND a.status='indexed'
+            "SELECT a.id FROM assets a WHERE a.available=1
              AND LOWER(COALESCE(a.extension,'')) IN ('png','jpg','jpeg','webp','gif','bmp','tif','tiff')
              AND NOT EXISTS (
                SELECT 1 FROM visual_tags vt
@@ -986,36 +1268,29 @@ pub fn save_image_embedding(
     page_number: i64,
     embedding: &[f32],
 ) -> Result<()> {
+    let embedding = crate::visual::preprocess::validate_and_normalize(
+        embedding.to_vec(),
+        crate::visual::encoder::EMBED_DIMS,
+    )?;
     let connection = connect(path)?;
     let now = Utc::now().to_rfc3339();
     connection.execute(
-        "INSERT INTO image_embeddings(asset_id,model_id,model_version,page_number,dimensions,embedding,indexed_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7)
+        "INSERT INTO image_embeddings(asset_id,model_id,model_version,page_number,dimensions,embedding,indexed_at,profile_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
          ON CONFLICT(asset_id,model_id,page_number)
          DO UPDATE SET model_version=excluded.model_version, dimensions=excluded.dimensions,
-                       embedding=excluded.embedding, indexed_at=excluded.indexed_at",
+                       embedding=excluded.embedding, indexed_at=excluded.indexed_at,
+                       profile_id=excluded.profile_id",
         params![
             asset_id,
             model_id,
             model_version,
             page_number,
             embedding.len() as i64,
-            embedding_to_blob(embedding),
-            now
+            embedding_to_blob(&embedding),
+            now,
+            crate::ai::MOBILECLIP_IMAGE_PROFILE_ID,
         ],
-    )?;
-    Ok(())
-}
-
-pub fn delete_image_embeddings(path: &Path, asset_id: &str, model_id: &str) -> Result<()> {
-    let connection = connect(path)?;
-    connection.execute(
-        "DELETE FROM image_embedding_regions WHERE asset_id=?1 AND model_id=?2",
-        params![asset_id, model_id],
-    )?;
-    connection.execute(
-        "DELETE FROM image_embeddings WHERE asset_id=?1 AND model_id=?2",
-        params![asset_id, model_id],
     )?;
     Ok(())
 }
@@ -1043,18 +1318,70 @@ pub fn save_image_embedding_region(
 }
 
 /// (asset_id, page_number, embedding) for every stored image vector of a model.
-pub fn load_image_embeddings(path: &Path, model_id: &str) -> Result<Vec<(String, i64, Vec<f32>)>> {
+pub fn load_image_embeddings(
+    path: &Path,
+    model_id: &str,
+    model_version: &str,
+    profile_id: &str,
+    expected_dims: usize,
+) -> Result<Vec<(String, i64, Vec<f32>)>> {
     let connection = connect(path)?;
     let mut statement = connection.prepare(
         "SELECT ie.asset_id, ie.page_number, ie.embedding
          FROM image_embeddings ie JOIN assets a ON a.id=ie.asset_id
-         WHERE ie.model_id=?1 AND a.available=1 AND a.status='indexed'",
+         WHERE ie.model_id=?1 AND ie.model_version=?2 AND ie.profile_id=?3
+           AND ie.dimensions=?4 AND a.available=1",
     )?;
-    let rows = statement.query_map([model_id], |r| {
-        let blob: Vec<u8> = r.get(2)?;
-        Ok((r.get(0)?, r.get(1)?, blob_to_embedding(&blob)))
-    })?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    let rows = statement.query_map(
+        params![model_id, model_version, profile_id, expected_dims as i64],
+        |r| {
+            let blob: Vec<u8> = r.get(2)?;
+            Ok((r.get(0)?, r.get(1)?, blob))
+        },
+    )?;
+    let mut output = Vec::new();
+    for row in rows {
+        let (asset_id, page, blob) = row?;
+        if let Ok(vector) = try_blob_to_embedding(&blob, expected_dims) {
+            output.push((asset_id, page, vector));
+        }
+    }
+    Ok(output)
+}
+
+/// Stream compatible image vectors through a caller-owned bounded scorer.
+/// This avoids materializing the entire vector table for every query.
+pub fn for_each_image_embedding(
+    path: &Path,
+    model_id: &str,
+    model_version: &str,
+    profile_id: &str,
+    expected_dims: usize,
+    mut visitor: impl FnMut(String, i64, Vec<f32>),
+) -> Result<usize> {
+    let connection = connect(path)?;
+    let mut statement = connection.prepare(
+        "SELECT ie.asset_id,ie.page_number,ie.embedding
+         FROM image_embeddings ie JOIN assets a ON a.id=ie.asset_id
+         WHERE ie.model_id=?1 AND ie.model_version=?2 AND ie.profile_id=?3
+           AND ie.dimensions=?4 AND a.available=1
+         ORDER BY ie.asset_id,ie.page_number",
+    )?;
+    let mut rows = statement.query(params![
+        model_id,
+        model_version,
+        profile_id,
+        expected_dims as i64
+    ])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        let blob: Vec<u8> = row.get(2)?;
+        if let Ok(vector) = try_blob_to_embedding(&blob, expected_dims) {
+            visitor(row.get(0)?, row.get(1)?, vector);
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 pub fn image_embeddings_for_all(
@@ -1064,13 +1391,30 @@ pub fn image_embeddings_for_all(
 ) -> Result<Vec<(i64, Vec<f32>)>> {
     let connection = connect(path)?;
     let mut statement = connection.prepare(
-        "SELECT page_number, embedding FROM image_embeddings WHERE asset_id=?1 AND model_id=?2 ORDER BY page_number DESC",
+        "SELECT page_number, embedding FROM image_embeddings
+         WHERE asset_id=?1 AND model_id=?2 AND model_version=?3 AND profile_id=?4 AND dimensions=512
+         ORDER BY page_number DESC",
     )?;
-    let rows = statement.query_map(params![asset_id, model_id], |row| {
-        let blob: Vec<u8> = row.get(1)?;
-        Ok((row.get(0)?, blob_to_embedding(&blob)))
-    })?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    let rows = statement.query_map(
+        params![
+            asset_id,
+            model_id,
+            crate::ai::VISUAL_MODEL_VERSION,
+            crate::ai::MOBILECLIP_IMAGE_PROFILE_ID
+        ],
+        |row| {
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((row.get(0)?, blob))
+        },
+    )?;
+    let mut output = Vec::new();
+    for row in rows {
+        let (page, blob) = row?;
+        if let Ok(vector) = try_blob_to_embedding(&blob, 512) {
+            output.push((page, vector));
+        }
+    }
+    Ok(output)
 }
 
 /// Replace an asset's visual classifications; `scored` is ordered best-first.
@@ -1459,16 +1803,24 @@ pub fn visual_counts(path: &Path, model_id: &str) -> Result<(i64, i64, i64, i64,
 pub fn indexed_asset_briefs(path: &Path) -> Result<Vec<crate::types::AssetBrief>> {
     let connection = connect(path)?;
     let mut statement = connection.prepare(
-        "SELECT id, folder_id, filename, extension, absolute_path
-         FROM assets WHERE available=1 AND status='indexed'",
+        "SELECT a.id, a.folder_id, a.filename, a.extension, a.absolute_path,
+                COALESCE(a.content_id,a.id), a.thumbnail_path IS NOT NULL
+         FROM assets a WHERE a.available=1 AND (
+           a.status='indexed' OR EXISTS (
+             SELECT 1 FROM image_embeddings ie
+             WHERE ie.asset_id=a.id AND ie.profile_id=?1 AND ie.dimensions=512
+           )
+         )",
     )?;
-    let rows = statement.query_map([], |r| {
+    let rows = statement.query_map([crate::ai::MOBILECLIP_IMAGE_PROFILE_ID], |r| {
         Ok(crate::types::AssetBrief {
             id: r.get(0)?,
             folder_id: r.get(1)?,
             filename: r.get(2)?,
             extension: r.get(3)?,
             source_path: r.get(4)?,
+            content_id: r.get(5)?,
+            thumbnail_available: r.get::<_, i64>(6)? != 0,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1501,6 +1853,18 @@ pub fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+pub fn try_blob_to_embedding(blob: &[u8], expected_dims: usize) -> Result<Vec<f32>> {
+    if blob.len() != expected_dims.saturating_mul(std::mem::size_of::<f32>()) {
+        return Err(crate::error::RecallError::Message(format!(
+            "Embedding blob length mismatch: expected {} bytes, got {}",
+            expected_dims * std::mem::size_of::<f32>(),
+            blob.len()
+        )));
+    }
+    let values = blob_to_embedding(blob);
+    crate::visual::preprocess::validate_and_normalize(values, expected_dims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1508,6 +1872,102 @@ mod tests {
     fn embedding_blob_round_trip() {
         let source = vec![0.25, -2.5, 9.75];
         assert_eq!(blob_to_embedding(&embedding_to_blob(&source)), source);
+    }
+
+    #[test]
+    fn embedding_blob_validation_rejects_trailing_zero_and_non_finite_data() {
+        let mut trailing = embedding_to_blob(&[1.0, 0.0]);
+        trailing.push(0);
+        assert!(try_blob_to_embedding(&trailing, 2).is_err());
+        assert!(try_blob_to_embedding(&embedding_to_blob(&[0.0, 0.0]), 2).is_err());
+        assert!(try_blob_to_embedding(&embedding_to_blob(&[f32::INFINITY, 1.0]), 2).is_err());
+    }
+
+    #[test]
+    fn schema_v7_registers_paired_visual_profiles() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("recall-profile-schema-{}.db", uuid::Uuid::new_v4()));
+        migrate(&path)?;
+        let connection = connect(&path)?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let profiles: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM embedding_profiles WHERE space_id=?1",
+            [crate::ai::VISUAL_SPACE_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, 7);
+        assert_eq!(profiles, 2);
+        drop(connection);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn visual_stage_remains_claimable_after_source_failure() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "recall-independent-visual-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        migrate(&path)?;
+        let connection = connect(&path)?;
+        connection.execute(
+            "INSERT INTO watched_folders(id,path,created_at) VALUES ('folder','C:/images','now')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO assets(id,folder_id,absolute_path,relative_path,filename,extension,mime_type,size_bytes,modified_at,status,available)
+             VALUES ('asset','folder','C:/images/photo.png','photo.png','photo.png','png','image/png',1,'now','failed',1)",
+            [],
+        )?;
+        drop(connection);
+        queue_extraction_stage(&path, "asset", "visual", "mobileclip2-s0", "2")?;
+        let (_, stage, asset) = claim_next_extraction_stage_job(&path)?.expect("visual stage");
+        assert_eq!(stage, "visual");
+        assert_eq!(asset.id, "asset");
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[test]
+    fn installed_models_resume_waiting_source_and_derived_jobs() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("recall-waiting-model-{}.db", uuid::Uuid::new_v4()));
+        migrate(&path)?;
+        let connection = connect(&path)?;
+        connection.execute(
+            "INSERT INTO watched_folders(id,path,created_at) VALUES ('folder','C:/images','now')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO assets(id,folder_id,absolute_path,relative_path,filename,extension,mime_type,size_bytes,modified_at,status,available)
+             VALUES ('asset','folder','C:/images/photo.png','photo.png','photo.png','png','image/png',1,'now','pending',1)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO indexing_jobs(id,asset_id,stage,state,created_at,updated_at)
+             VALUES ('source','asset','index','waiting_model','now','now')",
+            [],
+        )?;
+        drop(connection);
+        queue_extraction_stage(&path, "asset", "visual", "mobileclip2-s0", "2")?;
+        let connection = connect(&path)?;
+        connection.execute(
+            "UPDATE extraction_stage_jobs SET state='waiting_model' WHERE asset_id='asset'",
+            [],
+        )?;
+        drop(connection);
+        resume_waiting_model_jobs(&path)?;
+        let connection = connect(&path)?;
+        let pending: i64 = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM indexing_jobs WHERE state='pending') +
+                    (SELECT COUNT(*) FROM extraction_stage_jobs WHERE state='pending')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pending, 2);
+        drop(connection);
+        let _ = std::fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
@@ -1606,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_visual_version_requeues_only_indexed_images() -> Result<()> {
+    fn stale_visual_version_requeues_all_available_images_independently() -> Result<()> {
         let path =
             std::env::temp_dir().join(format!("recall-stale-visual-{}.db", uuid::Uuid::new_v4()));
         migrate(&path)?;
@@ -1631,7 +2091,7 @@ mod tests {
             )?;
         }
         drop(connection);
-        assert_eq!(queue_stale_visual_reindex(&path, "mobileclip", "2")?, 1);
+        assert_eq!(queue_stale_visual_reindex(&path, "mobileclip", "2")?, 2);
         let connection = connect(&path)?;
         let job: (String, String) = connection.query_row(
             "SELECT stage,state FROM extraction_stage_jobs WHERE asset_id='image'",
@@ -1700,7 +2160,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_visual_tag_version_requeues_only_visual_tagging() -> Result<()> {
+    fn stale_visual_tag_version_requeues_available_images_only() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "recall-stale-visual-tags-{}.db",
             uuid::Uuid::new_v4()
@@ -1730,7 +2190,7 @@ mod tests {
 
         assert_eq!(
             queue_stale_visual_tagging_reindex(&path, "visual-tags/general-v1", "2")?,
-            1
+            2
         );
         let connection = connect(&path)?;
         let job: (String, String, String, String) = connection.query_row(
@@ -1752,7 +2212,7 @@ mod tests {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(other_jobs, 0);
+        assert_eq!(other_jobs, 1);
         drop(connection);
         let _ = std::fs::remove_file(path);
         Ok(())

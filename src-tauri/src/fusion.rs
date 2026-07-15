@@ -3,10 +3,9 @@
 //! Builds a deterministic [`QueryPlan`], runs the retrieval channels (exact
 //! text via conjunction FTS, semantic text, visual, visual tags, metadata,
 //! filename), and combines them with intent-aware one-based
-//! Reciprocal-Rank Fusion. A result is returned only if it clears an evidence
-//! bar (one strong OR two moderate signals; semantic-text alone never
-//! qualifies). When nothing clears the bar the result set is empty — no weak
-//! result is ever normalized into a "100% match".
+//! Reciprocal-Rank Fusion. Text/document results require one strong or two
+//! moderate signals; an explicit visual-intent query may return ranked visual
+//! candidates without presenting rank as certainty.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -31,7 +30,7 @@ use crate::visual::PromptBank;
 
 const RRF_K: f32 = 60.0;
 const TEXT_CANDIDATES: usize = 50;
-const VISUAL_CANDIDATES: usize = 50;
+const VISUAL_CANDIDATES: usize = 100;
 const METADATA_CANDIDATES: usize = 40;
 const MAX_RESULTS: usize = 20;
 
@@ -39,12 +38,6 @@ const MAX_RESULTS: usize = 20;
 // Semantic (E5) similarity: moderate only, never a sole qualifier.
 const SEM_MODERATE: f32 = 0.85;
 // Visual (MobileCLIP text→image) cosine.
-const VIS_RAW_INCLUDE: f32 = 0.10;
-const VIS_RAW_MODERATE: f32 = 0.11;
-const VIS_RAW_STRONG: f32 = 0.14;
-const VIS_Z_INCLUDE: f32 = 2.5;
-const VIS_Z_MODERATE: f32 = 3.0;
-const VIS_Z_STRONG: f32 = 3.5;
 const VIS_MAD_FLOOR: f32 = 0.01;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,11 +78,12 @@ fn weights(intent: QueryIntent) -> HashMap<Channel, f32> {
             (Visual, 0.05),
         ],
         QueryIntent::Visual => &[
-            (Visual, 0.50),
-            (VisualTag, 0.30),
-            (Semantic, 0.08),
-            (Metadata, 0.07),
+            (Visual, 0.75),
+            (Exact, 0.08),
+            (Semantic, 0.05),
+            (Metadata, 0.02),
             (Filename, 0.05),
+            (VisualTag, 0.05),
         ],
         // Deterministic document-intent queries: document metadata and exact
         // OCR stay primary. Visual tags can help image-only assets, but generic
@@ -167,6 +161,12 @@ pub fn search_debug(
 ) -> Result<SearchDebugReport> {
     let plan = query_intent::plan(query);
     let outcome = execute(core, query, filters)?;
+    let visual = core.visual.read().clone();
+    let prompt = plan.visual_prompts.first().cloned();
+    let diagnostic_vector = match (visual.as_ref(), prompt.as_deref()) {
+        (Some(runtime), Some(prompt)) => Some(runtime.embed_text(prompt)?),
+        _ => None,
+    };
     Ok(SearchDebugReport {
         query: query.to_string(),
         visual_query: plan.visual_query,
@@ -177,6 +177,20 @@ pub fn search_debug(
         channels: outcome.channels,
         results: outcome.results,
         total_latency_ms: outcome.total_latency_ms,
+        model_revision: "4966d353f43c64efd99580a758f946950216b6e6".into(),
+        image_profile_id: ai::MOBILECLIP_IMAGE_PROFILE_ID.into(),
+        text_profile_id: ai::MOBILECLIP_TEXT_PROFILE_ID.into(),
+        visual_token_count: match (visual.as_ref(), prompt.as_deref()) {
+            (Some(runtime), Some(prompt)) => Some(runtime.token_count(prompt)?),
+            _ => None,
+        },
+        query_embedding_dims: diagnostic_vector.as_ref().map(Vec::len),
+        query_embedding_norm: diagnostic_vector
+            .as_ref()
+            .map(|vector| vector.iter().map(|value| value * value).sum::<f32>().sqrt()),
+        query_embedding_finite: diagnostic_vector
+            .as_ref()
+            .map(|vector| vector.iter().all(|value| value.is_finite())),
     })
 }
 
@@ -219,7 +233,9 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
     }
 
     let connection = db::connect(&core.db_path)?;
-    let candidates = search::load_candidates(&connection, filters)?;
+    let selection = ai::selection(&core.db_path)?;
+    let text_profile_id = ai::text_embedding_profile_id(&selection.embedding_model_id);
+    let candidates = search::load_candidates(&connection, filters, &text_profile_id)?;
     let briefs = db::indexed_asset_briefs(&core.db_path)?;
     // Filters must constrain every channel, including image-only assets that do
     // not appear in the filtered text-chunk candidate set.
@@ -303,7 +319,7 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
     let mut visual_region_scores: HashMap<String, Vec<f32>> = HashMap::new();
     let mut visual_best_region: HashMap<String, (i64, f32)> = HashMap::new();
     if let Some(runtime) = visual.as_ref() {
-        let model_id = ai::selection(&core.db_path)?.visual_model_id;
+        let model_id = selection.visual_model_id.clone();
 
         let t = Instant::now();
         let query_vectors = plan
@@ -311,29 +327,35 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
             .iter()
             .map(|prompt| runtime.embed_text(prompt))
             .collect::<Result<Vec<_>>>()?;
-        let embeddings = db::load_image_embeddings(&core.db_path, &model_id)?;
-        for (id, page, emb) in &embeddings {
-            if !allowed.contains(id) {
-                continue;
-            }
-            let vsim = query_vectors
-                .iter()
-                .map(|query_vector| search::cosine_similarity(query_vector, emb))
-                .fold(f32::MIN, f32::max)
-                .max(0.0);
-            visual_region_scores
-                .entry(id.clone())
-                .or_default()
-                .push(vsim);
-            visual_best_region
-                .entry(id.clone())
-                .and_modify(|best| {
-                    if vsim > best.1 {
-                        *best = (*page, vsim);
-                    }
-                })
-                .or_insert((*page, vsim));
-        }
+        db::for_each_image_embedding(
+            &core.db_path,
+            &model_id,
+            ai::VISUAL_MODEL_VERSION,
+            ai::MOBILECLIP_IMAGE_PROFILE_ID,
+            runtime.dims(),
+            |id, page, emb| {
+                if !allowed.contains(&id) {
+                    return;
+                }
+                let vsim = query_vectors
+                    .iter()
+                    .map(|query_vector| search::cosine_similarity(query_vector, &emb))
+                    .fold(f32::MIN, f32::max)
+                    .max(0.0);
+                visual_region_scores
+                    .entry(id.clone())
+                    .or_default()
+                    .push(vsim);
+                visual_best_region
+                    .entry(id.clone())
+                    .and_modify(|best| {
+                        if vsim > best.1 {
+                            *best = (page, vsim);
+                        }
+                    })
+                    .or_insert((page, vsim));
+            },
+        )?;
         for (id, scores) in visual_region_scores {
             visual_by_asset.insert(id, aggregate_region_scores(&scores));
         }
@@ -352,10 +374,7 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
         }
         let mut visual_hits: Vec<(String, f32)> = visual_by_asset
             .iter()
-            .filter(|(id, raw)| {
-                **raw >= VIS_RAW_INCLUDE
-                    && visual_z_by_asset.get(*id).copied().unwrap_or(0.0) >= VIS_Z_INCLUDE
-            })
+            .filter(|(_, raw)| raw.is_finite() && **raw > 0.0)
             .map(|(id, raw)| (id.clone(), *raw))
             .collect();
         visual_hits.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -485,7 +504,7 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
         ));
         strengths.push((
             MatchReason::VisualSimilarity,
-            visual_strength(visual_s, visual_z, plan.visual_query),
+            visual_strength(visual_s, plan.visual_query),
         ));
         strengths.push((
             MatchReason::VisualTag,
@@ -532,7 +551,10 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
 
         // Qualify: one strong, OR two independent moderate. Semantic alone never
         // qualifies (it is only ever Moderate, so it needs a second signal).
-        let Some(confidence) = confidence_for(strengths.iter().map(|(_, signal)| *signal)) else {
+        let visual_candidate = plan.visual_query && visual_s.is_finite() && visual_s > 0.0;
+        let Some(confidence) = confidence_for(strengths.iter().map(|(_, signal)| *signal))
+            .or_else(|| visual_candidate.then_some("candidate"))
+        else {
             continue;
         };
 
@@ -567,10 +589,23 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
         result.top_categories = top_categories;
         result.top_visual_tags = top_visual_tags;
         result.confidence = confidence.to_string();
+        result.thumbnail_available = brief.thumbnail_available;
+        result.alternate_location_count = brief_map
+            .values()
+            .filter(|candidate| candidate.content_id == brief.content_id)
+            .count()
+            .saturating_sub(1);
         assembled.push((result, *fused_score));
     }
 
     assembled.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut seen_content = HashSet::new();
+    assembled.retain(|(result, _)| {
+        brief_map
+            .get(&result.asset_id)
+            .map(|brief| seen_content.insert(brief.content_id.clone()))
+            .unwrap_or(false)
+    });
     assembled.truncate(MAX_RESULTS);
 
     // combined_score kept only for internal ordering; do not present as a %.
@@ -594,10 +629,8 @@ pub fn execute(core: &AppCore, query: &str, filters: &SearchFilters) -> Result<F
     Ok(finish(results, channels, applied_filters))
 }
 
-fn visual_strength(raw: f32, robust_z: f32, visual_query: bool) -> Strength {
-    if visual_query && raw >= VIS_RAW_STRONG && robust_z >= VIS_Z_STRONG {
-        Strength::Strong
-    } else if raw >= VIS_RAW_MODERATE && robust_z >= VIS_Z_MODERATE {
+fn visual_strength(raw: f32, visual_query: bool) -> Strength {
+    if visual_query && raw.is_finite() && raw > 0.0 {
         Strength::Moderate
     } else {
         Strength::None
@@ -607,9 +640,7 @@ fn visual_strength(raw: f32, robust_z: f32, visual_query: bool) -> Strength {
 fn visual_tag_strength(score: f32, visual_query: bool, document_query: bool) -> Strength {
     if document_query {
         Strength::None
-    } else if score >= 0.55 || (visual_query && score >= 0.45) {
-        Strength::Strong
-    } else if score >= 0.30 {
+    } else if score >= 0.30 || (visual_query && score >= 0.25) {
         Strength::Moderate
     } else {
         Strength::None
@@ -946,27 +977,21 @@ mod tests {
     }
 
     #[test]
-    fn robust_visual_outlier_can_qualify_open_visual_query() {
-        let values = [0.10, 0.10, 0.10, 0.10, 0.18];
-        let (median, mad) = robust_location_scale(&values);
-        let z = (0.18 - median) / mad.max(VIS_MAD_FLOOR);
-        assert_eq!(visual_strength(0.18, z, true), Strength::Strong);
-        assert_eq!(visual_strength(0.18, z, false), Strength::Moderate);
+    fn open_visual_candidate_does_not_require_a_distribution_outlier() {
+        assert_eq!(visual_strength(0.18, true), Strength::Moderate);
+        assert_eq!(visual_strength(0.18, false), Strength::None);
     }
 
     #[test]
-    fn flat_visual_distribution_does_not_qualify() {
-        let values = [0.12, 0.12, 0.12, 0.12];
-        let (median, mad) = robust_location_scale(&values);
-        let z = (0.12 - median) / mad.max(VIS_MAD_FLOOR);
-        assert_eq!(visual_strength(0.12, z, true), Strength::None);
+    fn zero_or_invalid_visual_scores_do_not_qualify() {
+        assert_eq!(visual_strength(0.0, true), Strength::None);
+        assert_eq!(visual_strength(f32::NAN, true), Strength::None);
     }
 
     #[test]
-    fn visual_tag_strength_can_qualify_open_visual_queries() {
+    fn visual_tags_are_never_strong_or_document_evidence() {
         assert_eq!(visual_tag_strength(0.44, true, false), Strength::Moderate);
-        assert_eq!(visual_tag_strength(0.45, true, false), Strength::Strong);
-        assert_eq!(visual_tag_strength(0.55, false, false), Strength::Strong);
+        assert_eq!(visual_tag_strength(0.55, false, false), Strength::Moderate);
         assert_eq!(visual_tag_strength(0.90, true, true), Strength::None);
     }
 
@@ -996,7 +1021,10 @@ mod tests {
                 .map_err(|_| "Set RECALL_APP_DATA to the Recall application-data directory")?,
         );
         let db_path = root.join("recall.db");
-        let model_dir = root.join("models");
+        db::migrate(&db_path)?;
+        let model_dir = std::env::var("RECALL_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| root.join("models"));
         let selection = ai::selection(&db_path)?;
         let text_runtime = Arc::new(ai::AiRuntime::load_for_selection(&model_dir, &selection)?);
         let visual_runtime = ai::load_visual_for_selection(&model_dir, &selection)?
@@ -1014,7 +1042,16 @@ mod tests {
             visual_prompts: parking_lot::RwLock::new(None),
         };
 
-        for query in ["dogs", "cats", "buildings"] {
+        let mut top_tens: HashMap<&str, Vec<HashSet<String>>> = HashMap::new();
+        let mut query_latencies = Vec::new();
+        for (query, label) in [
+            ("dog", "dog"),
+            ("dogs", "dog"),
+            ("cat", "cat"),
+            ("cats", "cat"),
+            ("building", "building"),
+            ("buildings", "building"),
+        ] {
             let plan = query_intent::plan(query);
             let runtime = core.visual.read().clone().expect("visual runtime");
             let vectors = plan
@@ -1023,7 +1060,13 @@ mod tests {
                 .map(|prompt| runtime.embed_text(prompt))
                 .collect::<Result<Vec<_>>>()?;
             let model_id = ai::selection(&core.db_path)?.visual_model_id;
-            let embeddings = db::load_image_embeddings(&core.db_path, &model_id)?;
+            let embeddings = db::load_image_embeddings(
+                &core.db_path,
+                &model_id,
+                ai::VISUAL_MODEL_VERSION,
+                ai::MOBILECLIP_IMAGE_PROFILE_ID,
+                runtime.dims(),
+            )?;
             let bank = prompt_bank(&core, &runtime, &model_id)?;
             let mut scores: Vec<(String, f32, f32, f32)> = embeddings
                 .iter()
@@ -1050,7 +1093,9 @@ mod tests {
                     *margin,
                 ))
             );
+            let query_started = Instant::now();
             let results = search(&core, query, &SearchFilters::default())?;
+            query_latencies.push(query_started.elapsed().as_millis());
             eprintln!(
                 "VISUAL_QUERY query={query:?} results={} top={:?}",
                 results.len(),
@@ -1061,8 +1106,97 @@ mod tests {
                     result.category_score,
                 ))
             );
-            assert!(!results.is_empty(), "{query:?} returned no visual results");
+            let relevant = |filename: &str| {
+                filename
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{label}_"))
+            };
+            assert!(
+                results
+                    .first()
+                    .map(|result| relevant(&result.filename))
+                    .unwrap_or(false),
+                "{query:?} top result was not labeled {label:?}"
+            );
+            let precision_at_5 = results
+                .iter()
+                .take(5)
+                .filter(|result| relevant(&result.filename))
+                .count() as f32
+                / 5.0;
+            let connection = db::connect(&core.db_path)?;
+            let pattern = format!("{label}_%");
+            let relevant_total: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM assets WHERE available=1 AND LOWER(filename) LIKE ?1",
+                [pattern],
+                |row| row.get(0),
+            )?;
+            let recall_at_10 = results
+                .iter()
+                .take(10)
+                .filter(|result| relevant(&result.filename))
+                .count() as f32
+                / relevant_total.max(1) as f32;
+            eprintln!(
+                "VISUAL_METRICS query={query:?} p@5={precision_at_5:.2} r@10={recall_at_10:.2}"
+            );
+            assert!(
+                precision_at_5 >= 0.80,
+                "{query:?} precision@5={precision_at_5}"
+            );
+            assert!(recall_at_10 >= 0.75, "{query:?} recall@10={recall_at_10}");
+            top_tens.entry(label).or_default().push(
+                results
+                    .iter()
+                    .take(10)
+                    .map(|result| result.asset_id.clone())
+                    .collect(),
+            );
         }
+        for (label, sets) in top_tens {
+            let intersection = sets[0].intersection(&sets[1]).count() as f32;
+            let union = sets[0].union(&sets[1]).count().max(1) as f32;
+            let jaccard = intersection / union;
+            eprintln!("VISUAL_STABILITY label={label:?} top10_jaccard={jaccard:.2}");
+            assert!(
+                jaccard >= 0.60,
+                "{label:?} singular/plural jaccard={jaccard}"
+            );
+        }
+        query_latencies.sort_unstable();
+        eprintln!(
+            "VISUAL_SEARCH_LATENCY corpus_assets=61 p50_ms={} p95_ms={}",
+            query_latencies[query_latencies.len() / 2],
+            query_latencies[query_latencies.len() - 1]
+        );
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "allocates up to ~195 MiB to measure the exact 512-d scan kernel"]
+    fn benchmark_exact_visual_scan_scaling() {
+        let dims = crate::visual::encoder::EMBED_DIMS;
+        let unit = 1.0_f32 / (dims as f32).sqrt();
+        let query = vec![unit; dims];
+        for count in [1_000_usize, 10_000, 100_000] {
+            let matrix = vec![unit; count * dims];
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let started = Instant::now();
+                let best = matrix
+                    .chunks_exact(dims)
+                    .map(|vector| vector.iter().zip(&query).map(|(a, b)| a * b).sum::<f32>())
+                    .fold(f32::MIN, f32::max);
+                std::hint::black_box(best);
+                samples.push(started.elapsed().as_millis());
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "VISUAL_SCAN vectors={count} bytes={} p50_ms={} p95_ms={}",
+                matrix.len() * std::mem::size_of::<f32>(),
+                samples[samples.len() / 2],
+                samples[samples.len() - 1]
+            );
+        }
     }
 }

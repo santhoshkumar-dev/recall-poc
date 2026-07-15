@@ -143,9 +143,10 @@ pub fn run() {
                 visual_tagger: RwLock::new(visual_tagger_runtime),
                 visual_prompts: RwLock::new(None),
             });
-            if core.visual.read().is_some() {
-                let selected = ai::selection(&core.db_path)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let _ = db::backfill_thumbnail_paths(&core.db_path, &core.thumbnail_dir);
+            let selected = ai::selection(&core.db_path)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if selected.visual_enabled() {
                 let queued = db::queue_stale_visual_reindex(
                     &core.db_path,
                     &selected.visual_model_id,
@@ -155,6 +156,19 @@ pub fn run() {
                 if queued > 0 {
                     eprintln!("[visual] queued {queued} stale image(s) for pipeline refresh");
                 }
+                if core.visual.read().is_some() {
+                    let _ = db::queue_missing_visual_categories(
+                        &core.db_path,
+                        &selected.visual_model_id,
+                    );
+                }
+            }
+            if core.ai.read().is_some() {
+                let _ = db::queue_stale_text_reindex(
+                    &core.db_path,
+                    &selected.embedding_model_id,
+                    &ai::text_embedding_profile_id(&selected.embedding_model_id),
+                );
             }
             if core.visual_tagger.read().is_some() {
                 let queued = db::queue_stale_visual_tagging_reindex(
@@ -193,6 +207,9 @@ pub fn run() {
             commands::search_files_debug,
             commands::get_visual_diagnostics,
             commands::reindex_visual_library,
+            commands::get_asset_thumbnail,
+            commands::get_asset_pipeline_status,
+            commands::get_reindex_status,
             commands::open_source_file,
             commands::reveal_source_file,
             commands::copy_source_path,

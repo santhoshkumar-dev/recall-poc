@@ -105,8 +105,23 @@ pub struct IndexingStatus {
     pub failed: i64,
     pub background_pending: i64,
     pub background_processing: i64,
+    pub waiting_model: i64,
+    pub reindex_generation: i64,
+    pub reindex_pending: i64,
+    pub reindex_completed: i64,
+    pub reindex_failed: i64,
     pub current_stage: Option<String>,
     pub current_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetStageStatus {
+    pub stage: String,
+    pub state: String,
+    pub attempts: i64,
+    pub error_message: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +154,8 @@ pub struct AssetBrief {
     pub filename: String,
     pub extension: Option<String>,
     pub source_path: String,
+    pub content_id: String,
+    pub thumbnail_available: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -183,6 +200,10 @@ pub struct SearchResult {
     /// is retained only as an internal ordering score, never shown as a %.
     #[serde(default)]
     pub confidence: String,
+    #[serde(default)]
+    pub thumbnail_available: bool,
+    #[serde(default)]
+    pub alternate_location_count: usize,
 }
 
 impl SearchResult {
@@ -219,6 +240,8 @@ impl SearchResult {
             top_categories: Vec::new(),
             top_visual_tags: Vec::new(),
             confidence: String::new(),
+            thumbnail_available: false,
+            alternate_location_count: 0,
         }
     }
 }
@@ -293,6 +316,13 @@ pub struct SearchDebugReport {
     pub channels: Vec<ChannelDiagnostics>,
     pub results: Vec<SearchResult>,
     pub total_latency_ms: u128,
+    pub model_revision: String,
+    pub image_profile_id: String,
+    pub text_profile_id: String,
+    pub visual_token_count: Option<usize>,
+    pub query_embedding_dims: Option<usize>,
+    pub query_embedding_norm: Option<f32>,
+    pub query_embedding_finite: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

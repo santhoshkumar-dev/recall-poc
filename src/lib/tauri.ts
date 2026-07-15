@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AssetSummary,
+  AssetStageStatus,
   BootstrapState,
   IndexingStatus,
   ModelCatalog,
@@ -52,6 +53,9 @@ export const recallApi = {
     desktopInvoke<SearchDebugReport>("search_files_debug", { query, filters }),
   visualDiagnostics: () => desktopInvoke<VisualDiagnostics>("get_visual_diagnostics"),
   reindexVisualLibrary: () => desktopInvoke<IndexingStatus>("reindex_visual_library"),
+  thumbnail: (assetId: string) => desktopInvoke<number[]>("get_asset_thumbnail", { assetId }),
+  assetPipelineStatus: (assetId: string) => desktopInvoke<AssetStageStatus[]>("get_asset_pipeline_status", { assetId }),
+  reindexStatus: () => desktopInvoke<IndexingStatus>("get_reindex_status"),
   open: (assetId: string) => desktopInvoke<void>("open_source_file", { assetId }),
   reveal: (assetId: string) => desktopInvoke<void>("reveal_source_file", { assetId }),
   copyPath: (assetId: string) => desktopInvoke<void>("copy_source_path", { assetId }),

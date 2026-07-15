@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use image::ImageFormat;
 
@@ -92,13 +95,7 @@ pub fn process_file(
             } else {
                 decoded.clone()
             };
-            fs::create_dir_all(thumbnail_dir)?;
-            image::imageops::thumbnail(&decoded, 768, 512)
-                .save_with_format(
-                    thumbnail_dir.join(format!("{asset_id}.png")),
-                    ImageFormat::Png,
-                )
-                .map_err(|e| RecallError::Message(format!("Thumbnail failed: {e}")))?;
+            write_thumbnail(&decoded, thumbnail_dir, asset_id)?;
             let mut text = ai.ocr_image(&ocr_image)?;
             // Whole-image OCR preserves broad layout. Region OCR restores text
             // density in tall, panoramic, and very-large screenshots where a
@@ -154,6 +151,19 @@ pub fn process_file(
         }
     }
     Ok(ProcessOutcome::Chunks(chunks))
+}
+
+pub fn write_thumbnail(
+    image: &image::RgbImage,
+    thumbnail_dir: &Path,
+    asset_id: &str,
+) -> Result<PathBuf> {
+    fs::create_dir_all(thumbnail_dir)?;
+    let path = thumbnail_dir.join(format!("{asset_id}.png"));
+    image::imageops::thumbnail(image, 768, 512)
+        .save_with_format(&path, ImageFormat::Png)
+        .map_err(|error| RecallError::Message(format!("Thumbnail failed: {error}")))?;
+    Ok(path)
 }
 
 /// Decode an image applying EXIF orientation, returning an RGB buffer.

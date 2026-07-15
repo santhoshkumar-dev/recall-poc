@@ -118,6 +118,7 @@ pub async fn update_model_selection(
             let embedding_changed = selected.embedding_model_id != previous.embedding_model_id;
             let visual_changed = selected.visual_model_id != previous.visual_model_id;
             *core.ai.write() = Some(runtime);
+            db::resume_waiting_model_jobs(&core.db_path)?;
 
             // Swap the visual runtime to match the new selection (load errors
             // are non-fatal: text search continues). Drop the cached prompt bank
@@ -227,6 +228,24 @@ pub async fn install_models(app: AppHandle, core: State<'_, Arc<AppCore>>) -> Re
     match result {
         Ok(runtime) => {
             *core.ai.write() = Some(runtime);
+            let selection = ai::selection(&core.db_path)?;
+            match ai::load_visual_for_selection(&core.model_dir, &selection) {
+                Ok(visual) => {
+                    *core.visual.write() = visual;
+                    if core.visual.read().is_some() {
+                        ai::set_visual_status(&core.db_path, "loaded");
+                        db::queue_stale_visual_reindex(
+                            &core.db_path,
+                            &selection.visual_model_id,
+                            ai::VISUAL_MODEL_VERSION,
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    ai::set_visual_status(&core.db_path, &format!("load error: {error}"));
+                    return Err(error);
+                }
+            }
             indexer::start_worker(app, core.clone());
             ai::status(&core.db_path)
         }
@@ -399,6 +418,9 @@ pub fn search_files_debug(
     query: String,
     filters: SearchFilters,
 ) -> Result<crate::types::SearchDebugReport> {
+    if !cfg!(debug_assertions) {
+        return Err("Retrieval diagnostics are unavailable in production builds".into());
+    }
     fusion::search_debug(&core, &query, &filters)
 }
 
@@ -406,6 +428,9 @@ pub fn search_files_debug(
 pub fn get_visual_diagnostics(
     core: State<'_, Arc<AppCore>>,
 ) -> Result<crate::types::VisualDiagnostics> {
+    if !cfg!(debug_assertions) {
+        return Err("Visual diagnostics are unavailable in production builds".into());
+    }
     let selection = ai::selection(&core.db_path)?;
     let model_id = selection.visual_model_id.clone();
     let runtime = core.visual.read().clone();
@@ -456,13 +481,6 @@ pub fn reindex_visual_library(
     if core.visual.read().is_none() {
         return Err("The visual-search runtime is not loaded".into());
     }
-    let (pending_jobs, processing_jobs, _failed_jobs) = db::active_job_counts(&core.db_path)?;
-    if processing_jobs > 0 || pending_jobs > 0 {
-        return Err(
-            "Wait for the current indexing queue to finish before re-indexing visuals".into(),
-        );
-    }
-
     db::queue_visual_stage_reindex(
         &core.db_path,
         &selection.visual_model_id,
@@ -478,6 +496,41 @@ pub fn reindex_visual_library(
     if !core.paused.load(Ordering::SeqCst) {
         indexer::start_worker(app, core.clone());
     }
+    db::indexing_status(&core.db_path)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_asset_thumbnail(core: State<'_, Arc<AppCore>>, asset_id: String) -> Result<Vec<u8>> {
+    let connection = db::connect(&core.db_path)?;
+    let exists: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM assets WHERE id=?1 AND available=1",
+            [asset_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Err("Thumbnail source is unavailable".into());
+    }
+    let path = core.thumbnail_dir.join(format!("{asset_id}.png"));
+    let canonical_root = core.thumbnail_dir.canonicalize()?;
+    let canonical_path = path.canonicalize()?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err("Security check failed: thumbnail is outside app data".into());
+    }
+    Ok(fs::read(canonical_path)?)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_asset_pipeline_status(
+    core: State<'_, Arc<AppCore>>,
+    asset_id: String,
+) -> Result<Vec<crate::types::AssetStageStatus>> {
+    db::asset_pipeline_status(&core.db_path, &asset_id)
+}
+
+#[tauri::command]
+pub fn get_reindex_status(core: State<'_, Arc<AppCore>>) -> Result<IndexingStatus> {
     db::indexing_status(&core.db_path)
 }
 

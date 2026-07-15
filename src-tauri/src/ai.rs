@@ -69,15 +69,17 @@ const E5_TOKENIZER_CONFIG_URL: &str =
 // BPE tokenizer). 512-d shared cross-modal space. SHA256 pinned from the HF LFS
 // metadata of plhery/mobileclip2-onnx (onnx/s0/*).
 const MOBILECLIP_VISION_URL: &str =
-    "https://huggingface.co/plhery/mobileclip2-onnx/resolve/main/onnx/s0/vision_model.onnx";
+    "https://huggingface.co/plhery/mobileclip2-onnx/resolve/4966d353f43c64efd99580a758f946950216b6e6/onnx/s0/vision_model.onnx";
 const MOBILECLIP_VISION_SHA256: &str =
     "13d20ebfa8a8f63890eb2727fe4dc63009ff970f43e0f7d9d2ed999659f70c8a";
 const MOBILECLIP_TEXT_URL: &str =
-    "https://huggingface.co/plhery/mobileclip2-onnx/resolve/main/onnx/s0/text_model.onnx";
+    "https://huggingface.co/plhery/mobileclip2-onnx/resolve/4966d353f43c64efd99580a758f946950216b6e6/onnx/s0/text_model.onnx";
 const MOBILECLIP_TEXT_SHA256: &str =
     "df590d47744f2ee9f3ccb67c4414d17419568c05bca0c4d166f2faeedf8b92f3";
 const MOBILECLIP_TOKENIZER_URL: &str =
-    "https://huggingface.co/plhery/mobileclip2-onnx/resolve/main/tokenizer.json";
+    "https://huggingface.co/plhery/mobileclip2-onnx/resolve/4966d353f43c64efd99580a758f946950216b6e6/tokenizer.json";
+const MOBILECLIP_TOKENIZER_SHA256: &str =
+    "b556ac8c99757ffb677208af34bc8c6721572114111a6e0aaf5fa69ff0b8d842";
 pub const OCRS_NATIVE: &str = "ocrs-native";
 pub const PPOCRV6_TINY: &str = "ppocrv6-tiny";
 pub const PPOCRV6_SMALL: &str = "ppocrv6-small";
@@ -90,6 +92,11 @@ pub const MOBILECLIP2_S0: &str = "mobileclip2-s0";
 pub const VISUAL_TAGGER_GENERAL: &str = "visual-tags/general-v1";
 /// Bump when the visual encoder itself changes (regenerate image embeddings).
 pub const VISUAL_MODEL_VERSION: &str = "2";
+/// Query-side profile changed when CLIP padding was corrected to zero.
+pub const VISUAL_TEXT_PROFILE_VERSION: &str = "3";
+pub const VISUAL_SPACE_ID: &str = "mobileclip2-s0-space-v1";
+pub const MOBILECLIP_IMAGE_PROFILE_ID: &str = "mobileclip2-s0-image-v2";
+pub const MOBILECLIP_TEXT_PROFILE_ID: &str = "mobileclip2-s0-text-v3";
 /// Bump when visual tagging preprocessing / thresholds change.
 pub const VISUAL_TAGGER_VERSION: &str = "1";
 /// Bump when chunking (regional chunks / summary) changes materially.
@@ -114,6 +121,10 @@ pub struct ModelSelection {
 
 fn default_visual_model() -> String {
     DEFAULT_VISUAL_MODEL.to_string()
+}
+
+pub fn text_embedding_profile_id(model_id: &str) -> String {
+    format!("{model_id}-chunks-v{CHUNKING_VERSION}")
 }
 
 impl ModelSelection {
@@ -705,10 +716,11 @@ fn install_visual(app: &AppHandle, model_dir: &Path, model_id: &str) -> Result<(
     // Only tokenizer.json is read at runtime; config.json (98 B) /
     // preprocessor_config.json values are hardcoded in the encoder, and their
     // tiny size trips download_file's small-file guard, so we don't fetch them.
-    download_file(
+    download_verified(
         app,
         MOBILECLIP_TOKENIZER_URL,
         &directory.join("tokenizer.json"),
+        MOBILECLIP_TOKENIZER_SHA256,
         94,
         95,
     )?;
@@ -729,6 +741,18 @@ pub fn load_visual_for_selection(
         return Ok(None);
     }
     let dir = visual_directory(model_dir, &selected.visual_model_id);
+    for (name, expected) in [
+        ("vision_model.onnx", MOBILECLIP_VISION_SHA256),
+        ("text_model.onnx", MOBILECLIP_TEXT_SHA256),
+        ("tokenizer.json", MOBILECLIP_TOKENIZER_SHA256),
+    ] {
+        let actual = sha256_file(&dir.join(name))?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(RecallError::Message(format!(
+                "MobileCLIP artifact checksum mismatch for {name}: expected {expected}, got {actual}"
+            )));
+        }
+    }
     Ok(Some(Arc::new(crate::visual::VisualRuntime::load(&dir)?)))
 }
 

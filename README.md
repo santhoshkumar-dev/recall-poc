@@ -17,7 +17,7 @@ below are the corresponding build instructions.
 - Tauri 2 native Windows shell with a Next.js static-export frontend.
 - Native recursive folder selection and scanning.
 - SQLite persistence with FTS5 and a restart-safe indexing queue.
-- TXT, Markdown, page-preserving text PDF, PNG, JPEG, and WebP extraction.
+- TXT, Markdown, page-preserving text PDF, PNG, JPEG, WebP, GIF, BMP, and TIFF extraction.
 - PP-OCRv6 Tiny at a 1280px cap by default, with local multilingual-e5-small INT8 embeddings.
 - Hybrid ranking: 75% cosine similarity and 25% normalized FTS5/BM25.
 - Exact snippets, PDF page citations, file-type/folder filters, open, reveal, and copy-path actions.
@@ -32,16 +32,16 @@ authentication, cloud sync, and Office formats are intentionally out of scope fo
 Recall can additionally index images with **MobileCLIP2-S0** for visual and cross-modal
 search, kept in a vector space completely separate from the E5 text space.
 
-- **Optional model.** Enable *MobileCLIP2-S0* in Privacy → Developer model lab → *Visual
-  image search model*. It downloads a community ONNX export (paired vision + text encoders,
-  CLIP BPE tokenizer, 512-d, ~290 MB) with pinned SHA256, and runs on the local `ort`
-  runtime. Disabled by default — the app boots and searches text without it.
-- **Four retrieval channels, fused by rank.** Exact text (FTS5), semantic text (E5),
-  visual (MobileCLIP text→image), visual categories (zero-shot prompt bank), plus metadata
+- **Local paired model.** MobileCLIP2-S0 downloads as one versioned vision/text/tokenizer
+  profile (512-d, ~302 MB) with immutable revision URLs and pinned SHA256 values. Recall
+  still boots and searches text if the optional visual pack is unavailable.
+- **Independent retrieval channels, fused by rank.** Exact text (FTS5), semantic text (E5),
+  visual (MobileCLIP text→image), optional weak visual tags, plus metadata
   and filename/folder signals. Channels are normalized independently and combined with
   intent-aware Reciprocal-Rank Fusion (RRF, k=60); weights vary by detected query intent.
-- **Zero-shot categories.** An editable prompt bank (`src-tauri/src/visual/category_prompts.rs`)
-  scores each image into its top visual categories; used as ranking boosts, never as filters.
+- **Diagnostic categories.** An editable prompt bank (`src-tauri/src/visual/category_prompts.rs`)
+  scores images for developer inspection only. Categories are not filters, qualifiers,
+  searchable chunks, or ranking boosts.
 - **Generic metadata + summaries.** Deterministic (no-LLM) extraction of dates, amounts,
   URLs, emails, phones and identifiers, plus a structured searchable summary embedded with E5.
 - **Ticket-aware document evidence.** OCR/PDF text and filenames are classified locally as
@@ -59,8 +59,8 @@ search, kept in a vector space completely separate from the E5 text space.
 - **Stable identity + provenance.** SHA-256 content identities survive renames/moves within a
   watched folder. Reduced per-stage provenance records the extractor/version, source region,
   confidence, and queue job for deterministic document analysis.
-- **Explainable results.** Each result shows *why* it matched; a per-query retrieval inspector
-  (toggle in Search) shows per-channel ranks, scores, intents and latency.
+- **Compact visual results.** Search uses a responsive thumbnail grid with a short match reason
+  and minimal actions. The detailed retrieval inspector is available only in development builds.
 - **Scoped reindexing.** Enabling/switching the visual model regenerates image embeddings and
   categories only — OCR and document-text embeddings are untouched.
 
@@ -97,11 +97,14 @@ Tauri is configured to build both NSIS `.exe` and WiX `.msi` packages. The insta
 ## First run
 
 1. Select **Download models**. Recall downloads the PP-OCRv6 Tiny and multilingual-e5-small INT8 packs into its application-data directory. Interrupted downloads resume automatically.
-2. Choose one or more folders. Only `.txt`, `.md`, `.pdf`, `.png`, `.jpg`, `.jpeg`, and `.webp` files are considered.
+2. Choose one or more folders. Recall accepts `.txt`, `.md`, `.pdf`, `.png`, `.jpg`, `.jpeg`,
+   `.webp`, `.gif`, `.bmp`, `.tif`, and `.tiff`; common extensionless image formats are detected
+   by signature. AVIF and HEIC are not supported in this release.
 3. Wait for the durable queue to finish, then search in natural language.
 4. Disconnect networking and repeat searches to validate cached offline inference.
 
-If models are missing, text documents can still be indexed for keyword search. Image jobs remain pending until OCR is installed.
+If models are missing, text documents can still be indexed for keyword search. OCR and visual
+image stages wait independently, so an OCR failure cannot prevent MobileCLIP indexing.
 
 ## Sample corpus
 
@@ -126,6 +129,8 @@ After installing the model packs, run the local-only benchmarks from `src-tauri`
 $env:RECALL_MODEL_DIR = "$env:APPDATA\com.recall.desktop\models"
 cargo test benchmark_installed_embedding_models --lib -- --ignored --nocapture
 cargo test benchmark_installed_ocr_models --lib -- --ignored --nocapture
+cargo test benchmark_installed_visual_model --lib -- --ignored --nocapture
+cargo test benchmark_exact_visual_scan_scaling --lib -- --ignored --nocapture
 ```
 
 The OCR benchmark measures PP-OCRv6 Tiny and Small on `sample-data/restaurant-card.jpg`, checks for “Green Pepper Kitchen”, and prints median latency. The embedding benchmark measures throughput and checks that the restaurant document ranks first for its query. Install Tiny and Small through the Developer model lab before running the OCR comparison.

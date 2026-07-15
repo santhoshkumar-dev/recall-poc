@@ -49,8 +49,12 @@ impl PromptBank {
     /// Load the prompt bank for the current version from disk, building and
     /// caching it (one text-encode per prompt) on a miss.
     pub fn load_or_build(runtime: &VisualRuntime, visual_dir: &Path) -> Result<Self> {
-        let version = category_prompts::PROMPT_BANK_VERSION;
-        let path = cache_path(visual_dir, version);
+        let version = format!(
+            "{}-text{}",
+            category_prompts::PROMPT_BANK_VERSION,
+            crate::ai::VISUAL_TEXT_PROFILE_VERSION
+        );
+        let path = cache_path(visual_dir, &version);
         if let Ok(bytes) = std::fs::read(&path) {
             if let Ok(cache) = serde_json::from_slice::<PromptCache>(&bytes) {
                 if cache.version == version && !cache.prompts.is_empty() {
@@ -69,10 +73,7 @@ impl PromptBank {
                 vector,
             });
         }
-        let cache = PromptCache {
-            version: version.to_string(),
-            prompts,
-        };
+        let cache = PromptCache { version, prompts };
         if let Ok(bytes) = serde_json::to_vec(&cache) {
             let _ = std::fs::write(&path, bytes);
         }
